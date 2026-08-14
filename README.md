@@ -6,6 +6,8 @@ A bridge script that sends clips from a DaVinci Resolve timeline to After Effect
 
 This is not a persistent link like Adobe Dynamic Link. Each time you run it, the script writes out the current timeline state as JSON and After Effects rebuilds it as a new composition — a one-shot transfer. After the transfer, there is no ongoing dependency between Resolve and After Effects; editing either one has no effect on the other.
 
+**This is a convenience script, not a data interchange format.** Unlike EDL, AAF, or XML, it makes no accuracy guarantees. The transform math (scale, position, anchor point, etc.) was derived empirically by comparing Resolve's inspector values against After Effects' rendered output, not from official specifications. It's built to save time on a repetitive manual task, not to be a certified, lossless bridge between the two applications. Always check the result against the original timeline before relying on it.
+
 ## What it does
 
 - Sends all clips overlapping the timeline's IN/OUT range in one go (clips crossing the range boundary are trimmed at the edge)
