@@ -32,7 +32,12 @@ Adobe Dynamic Link のような常時リンクではありません。実行す�
 - Adobe After Effects（2024 以降推奨）
 - macOS または Windows
 
-検証は macOS + DaVinci Resolve + After Effects 2026 の組み合わせで行っています。Windows 版のパス探索・起動コマンドはロジック上は動作するはずですが、実機での網羅的な検証はまだ行えていません。動かない場合は Issue を歓迎します。
+検証は macOS + DaVinci Resolve + After Effects 2026 の組み合わせで行っています。
+
+**OSによってAEへの送信方式が異なります。**
+
+- **macOS**: AppleScript経由でAEに直接スクリプト実行を指示します。常駐や追加設定は不要で、`r2ae`を実行するだけで自動的に完結します。
+- **Windows**: 起動中のAfter Effectsプロセスを検出し、`AfterFX.exe -r`で直接スクリプトを実行させます。**あらかじめAfter Effectsを起動しておく必要があります**（未起動の場合は自動起動せず、その旨がResolveのコンソールに表示されます。JSONは書き出し済みなので、後からAEを起動して再実行すれば送れます）。複数バージョンのAEがインストールされている場合、実際に**起動しているバージョン**にクリップが送られます。
 
 ## インストール
 
@@ -64,9 +69,14 @@ Resolve が返す値を確認したいときのための調査用スクリプト
 
 ## 使い方
 
+**Windowsの場合、事前に After Effects を起動しておいてください。** 未起動のままだとResolveから自動では起動できません（詳細は下記）。
+
 1. Resolve のタイムラインで、送りたい範囲を `I` / `O` キーで IN/OUT 指定する
 2. Workspace > Scripts > Utility > `r2ae` を実行
-3. After Effects が起動 / 前面化し、新しいコンポジションが自動生成される
+
+**macOS**: After Effects が起動 / 前面化し、新しいコンポジションが自動生成されます。
+
+**Windows**: JSONが書き出された後、起動中のAfter Effectsへ`AfterFX.exe -r`で直接スクリプトを実行させます。**After Effectsを先に起動しておいてください**。未起動の場合はコンソールにその旨が表示され、JSONは書き出し済みのままになります。うまく実行されない場合は、AEのファイル > スクリプト > スクリプトファイルを実行から`r2ae_receive.jsx`を手動で開いてください。
 
 IN/OUT 範囲に重なる全トラックのクリップが対象になります。範囲をまたぐクリップは端で切り詰められ、コンポジションの尺は指定した範囲と一致します。IN/OUT が設定されていない場合は何も送信されません。
 
@@ -86,8 +96,9 @@ IN/OUT 範囲に重なる全トラックのクリップが対象になります�
 ## 仕組み
 
 1. `r2ae.lua` が Resolve Scripting API 経由でタイムラインを読み、対象クリップのパス・トリム位置・Transform 値・速度をまとめて JSON に書き出す
-2. macOS では `osascript`、Windows では `AfterFX.exe -r` で After Effects を起動し、`r2ae_receive.jsx` を実行させる
-3. `r2ae_receive.jsx` が JSON を読み込み、素材をインポートしてコンポジションを構築する
+2. **macOS**: `osascript` で After Effects に `r2ae_receive.jsx` の実行を直接指示する
+3. **Windows**: `Get-Process` で起動中の`AfterFX.exe`の実パスを取得し、`AfterFX.exe -r`で`r2ae_receive.jsx`の実行を直接指示する（After Effectsが起動している必要がある。うまくいかない場合は手動実行で後から取り込める）
+4. `r2ae_receive.jsx` が JSON を読み込み、素材をインポートしてコンポジションを構築する
 
 以降、両ソフト間の接続は残りません。
 
@@ -100,6 +111,7 @@ Resolve のインスペクタ値（Zoom / Pan / Tilt / Anchor Point / Rotation�
 - Resolve Scripting API には「タイムライン上で選択中のクリップ」を取得する手段がありません。そのため範囲指定は IN/OUT で行います。特定のクリップだけを送りたい場合は、トラックやクリップの有効・無効と併用してください
 - 素材 fps とタイムライン fps が異なる場合のコンフォームと、実際の速度変更の判定はヒューリスティックです。誤判定に気づいた場合は Issue で実測値（Resolve Console のログ）を添えて報告してください
 - ピッチ / ヨーは Resolve と After Effects で投影モデルが異なるため、正確な再現ができず非対応としています
+- Windowsの自動実行には、あらかじめAfter Effectsが起動している必要があります。未起動の場合は自動起動せず、コンソールにその旨が表示されます（JSONは書き出し済みなので、後からAEを起動して手動実行で取り込めます）
 
 ## ライセンス
 

@@ -256,11 +256,34 @@
                 var footage = findExistingFootage(src.fsName);
                 if (!footage) {
                     var io = new ImportOptions(src);
+                    if (c.is_sequence) {
+                        // Resolveから渡されるパスは連番の先頭フレーム。
+                        // Mac側の既存動作は維持。
+                        io.sequence = true;
+
+                        // Windowsでは連番認識を明示的に再設定する。
+                        if ($.os.indexOf("Windows") >= 0) {
+                            try {
+                                var seqName = src.name;
+                                if (/^.*?\d+\.[^.]+$/.test(seqName)) {
+                                    io.sequence = true;
+                                }
+                            } catch (eSeq) {}
+                        }
+                    }
                     if (io.canImportAs(ImportAsType.FOOTAGE)) {
                         io.importAs = ImportAsType.FOOTAGE;
                     }
                     footage = app.project.importFile(io);
                     footage.parentFolder = footageFolder;
+
+                    if (c.is_sequence) {
+                        // 連番はデフォルトのフレームレート想定を持つため、
+                        // タイムラインのfpsに合わせて明示的に上書きする
+                        try {
+                            footage.mainSource.conformFrameRate = fps;
+                        } catch (eFps) {}
+                    }
                 }
 
                 var layer = comp.layers.add(footage);

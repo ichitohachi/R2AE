@@ -32,7 +32,12 @@ This is not a persistent link like Adobe Dynamic Link. Each time you run it, the
 - Adobe After Effects (2024 or later recommended)
 - macOS or Windows
 
-Testing has been done on macOS with DaVinci Resolve and After Effects 2026. The Windows path detection and launch command should work logically, but haven't been exhaustively verified on a real machine yet. If something doesn't work, issues are welcome.
+Testing has been done on macOS with DaVinci Resolve and After Effects 2026.
+
+**The delivery mechanism to After Effects differs by OS.**
+
+- **macOS**: Uses AppleScript to tell After Effects to run the script directly. No setup beyond installing the two files is needed — running `r2ae` is enough.
+- **Windows**: Detects the running After Effects process and calls `AfterFX.exe -r` to run the script directly against it. **After Effects needs to already be running** — if it isn't, R2AE doesn't launch it automatically; the Resolve console says so, and the JSON is left written for you to pick up once you've opened After Effects and run `r2ae` again. If multiple AE versions are installed, the clips go to whichever version is currently running.
 
 ## Installation
 
@@ -64,9 +69,14 @@ A diagnostic script for inspecting the raw values Resolve returns. Place it in t
 
 ## Usage
 
+**On Windows, open After Effects first.** If it isn't already running, R2AE can't launch it automatically (details below).
+
 1. In the Resolve timeline, mark the range you want to send using `I` / `O` (In/Out points)
 2. Run Workspace > Scripts > Utility > `r2ae`
-3. After Effects launches (or comes to the foreground) and a new composition is built automatically
+
+**macOS**: After Effects launches (or comes to the foreground) and a new composition is built automatically.
+
+**Windows**: After the JSON is written, R2AE detects the running After Effects process and sends the script to it directly via `AfterFX.exe -r`. **After Effects needs to be open first** — if it isn't, the Console says so and the JSON stays written for later. If direct execution doesn't work in your environment, open `r2ae_receive.jsx` manually via File > Scripts > Run Script File.
 
 All clips on any track that overlap the IN/OUT range are included. Clips crossing the range boundary are trimmed at the edge, and the composition's duration matches the marked range exactly. If no IN/OUT range is set, nothing is sent.
 
@@ -86,8 +96,9 @@ Behavior can be changed via variables at the top of `r2ae.lua`.
 ## How it works
 
 1. `r2ae.lua` reads the timeline via the Resolve Scripting API and writes each target clip's file path, trim points, transform values, and speed to a JSON file
-2. On macOS, `osascript` launches After Effects; on Windows, `AfterFX.exe -r` does the same, and either way `r2ae_receive.jsx` is executed
-3. `r2ae_receive.jsx` reads the JSON, imports the footage, and builds the composition
+2. **macOS**: `osascript` tells After Effects to run `r2ae_receive.jsx` directly
+3. **Windows**: finds the running `AfterFX.exe` process via `Get-Process` and calls `AfterFX.exe -r` to run `r2ae_receive.jsx` directly (After Effects must already be running; if this doesn't work in your environment, manual execution can pick up the JSON instead)
+4. `r2ae_receive.jsx` reads the JSON, imports the footage, and builds the composition
 
 After that, there is no remaining connection between the two applications.
 
@@ -100,6 +111,7 @@ Resolve's inspector values (Zoom / Pan / Tilt / Anchor Point / Rotation) live in
 - The Resolve Scripting API has no way to query which clips are currently selected on the timeline. Because of this, range selection is done via IN/OUT marks. If you need to send only specific clips, combine this with track/clip enable-disable
 - The check that distinguishes a frame-rate conform from an actual speed change is heuristic. If you notice a misclassification, please file an issue with the measured values (from the Resolve Console log)
 - Pitch / Yaw are not supported, since Resolve and After Effects use different projection models and cannot be reconciled accurately
+- Windows automatic execution requires After Effects to already be running. If it isn't, R2AE doesn't launch it automatically — the Console will say so, and the JSON stays written so you can pick it up later (open After Effects, then run the script manually)
 
 ## License
 
