@@ -131,7 +131,10 @@
     function placeLayer(layer, c, fps, footage) {
         var offsetSec = c.offset / fps;
         var durSec = c.duration / fps;
-        var inSec = c.source_in / fps;
+        // source_in は素材フレーム基準の値。素材fps（無ければタイムラインfps）
+        // で秒に換算する。タイムラインfpsで割るとfps不一致時にイン点がズレる
+        var srcFps = (c.src_fps && c.src_fps > 0) ? c.src_fps : fps;
+        var inSec = c.source_in / srcFps;
         var speed = (c.speed != null) ? c.speed : 1;
 
         function placeNormal() {
@@ -279,9 +282,12 @@
 
                     if (c.is_sequence) {
                         // 連番はデフォルトのフレームレート想定を持つため、
-                        // タイムラインのfpsに合わせて明示的に上書きする
+                        // Resolveでの素材fps（取得できなければタイムラインfps）
+                        // に合わせて明示的に上書きする。source_in の秒換算と
+                        // AE側のフッテージ解釈を同じfpsに揃えるため
                         try {
-                            footage.mainSource.conformFrameRate = fps;
+                            footage.mainSource.conformFrameRate =
+                                (c.src_fps && c.src_fps > 0) ? c.src_fps : fps;
                         } catch (eFps) {}
                     }
                 }
