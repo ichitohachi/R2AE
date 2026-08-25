@@ -310,11 +310,19 @@ local function collect_track(trackType, trackIndex)
                             end
                         end
 
+                        -- 素材fps。source_in は素材フレーム基準の値なので、
+                        -- タイムラインfpsと異なる場合の換算に必要（AE側で使う）
+                        local srcFps = tonumber(props["FPS"])
+                        if not srcFps or srcFps <= 0 then srcFps = nil end
+
                         -- 範囲からはみ出した分を切り詰める
                         -- リタイム中は素材側の進み方も倍率に従う
+                        -- 切り詰め量はタイムラインフレーム数なので、
+                        -- fps比（コンフォーム）を掛けて素材フレームに換算する
                         local cs = math.max(s, rangeIn)
                         local ce = math.min(e, rangeOut)
-                        sourceIn = sourceIn + (cs - s) * speed
+                        local conform = (srcFps and fps > 0) and (srcFps / fps) or 1
+                        sourceIn = sourceIn + (cs - s) * speed * conform
 
                         -- 素材解像度（スケール計算に使う）
                         local sw, sh = nil, nil
@@ -334,6 +342,7 @@ local function collect_track(trackType, trackIndex)
                             source_in = sourceIn,
                             mute_audio = false,
                             speed = speed,
+                            src_fps = srcFps,
                             src_w = sw,
                             src_h = sh,
                             is_sequence = isSequence,
@@ -461,6 +470,9 @@ ensure_dir(BRIDGE_DIR)
 local parts = {}
 for _, c in ipairs(finalList) do
     local extra = ""
+    if c.src_fps then
+        extra = extra .. string.format(', "src_fps": %s', tostring(c.src_fps))
+    end
     if c.src_w and c.src_h then
         extra = extra .. string.format(', "src_w": %d, "src_h": %d', c.src_w, c.src_h)
     end
@@ -481,7 +493,7 @@ for _, c in ipairs(finalList) do
     end
     table.insert(parts, string.format(
         '    {"name": "%s", "path": "%s", "kind": "%s", "track": %d, ' ..
-        '"offset": %d, "duration": %d, "source_in": %d, "mute_audio": %s, ' ..
+        '"offset": %d, "duration": %d, "source_in": %.6f, "mute_audio": %s, ' ..
         '"speed": %s%s}',
         json_escape(c.name), json_escape(c.path), c.kind, c.track,
         c.start - minStart, c.duration, c.source_in,
