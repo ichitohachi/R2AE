@@ -1,88 +1,44 @@
--- r2ae_debug.lua
--- 再生ヘッド位置のクリップについて、Resolveが返す値をすべてConsoleに出力する
---
--- 置き場所:
---   macOS   : ~/Library/Application Support/Blackmagic Design/DaVinci Resolve/Fusion/Scripts/Utility/r2ae_debug.lua
---   Windows : %APPDATA%\Blackmagic Design\DaVinci Resolve\Support\Fusion\Scripts\Utility\r2ae_debug.lua
---
--- 使い方:
---   1. Workspace > Console を開いておく
---   2. 速度を変更したクリップに再生ヘッドを合わせる
---   3. Workspace > Scripts > Utility > r2ae_debug を実行
-
-if not resolve then
-    print("Resolve内から実行してください")
-    return
-end
-
+-- R2AE read-only diagnostic. Run inside Resolve's Workspace > Console (Lua),
+-- or install beside r2ae.lua. No timeline/project settings or files are changed.
+if not resolve then print("Resolve内から実行してください") return end
 local project = resolve:GetProjectManager():GetCurrentProject()
 local timeline = project and project:GetCurrentTimeline()
-if not timeline then
-    print("タイムラインが開かれていません")
-    return
-end
-
-local item = timeline:GetCurrentVideoItem()
-if not item then
-    print("再生ヘッドの位置にビデオクリップがありません")
-    return
-end
-
-local function try(label, fn)
+if not timeline then print("タイムラインが開かれていません") return end
+local function dump(label, fn)
     local ok, v = pcall(fn)
-    if ok then
-        print(string.format("  %-22s = %s", label, tostring(v)))
-    else
-        print(string.format("  %-22s = <取得不可>", label))
+    print("-- " .. label .. " --")
+    if not ok then print("<取得不可> " .. tostring(v)) return end
+    local function show(value, prefix, depth)
+        if type(value) ~= "table" then print(prefix .. tostring(value)) return end
+        if depth > 4 then print(prefix .. "...") return end
+        local keys = {}
+        for k in pairs(value) do keys[#keys+1] = k end
+        table.sort(keys, function(a,b) return tostring(a)<tostring(b) end)
+        for _, k in ipairs(keys) do show(value[k], prefix .. tostring(k) .. ": ", depth+1) end
     end
+    show(v, "", 0)
 end
-
-print("========== クリップ情報 ==========")
-print("name: " .. tostring(item:GetName()))
-print("timelineFrameRate: " ..
-    tostring(project:GetSetting("timelineFrameRate")))
-
-print("-- タイムライン上の位置 --")
-try("GetStart", function() return item:GetStart() end)
-try("GetEnd", function() return item:GetEnd() end)
-try("GetDuration", function() return item:GetDuration() end)
-
-print("-- 素材側の範囲 --")
-try("GetLeftOffset", function() return item:GetLeftOffset() end)
-try("GetRightOffset", function() return item:GetRightOffset() end)
-try("GetSourceStartFrame", function() return item:GetSourceStartFrame() end)
-try("GetSourceEndFrame", function() return item:GetSourceEndFrame() end)
-try("GetSourceStartTime", function() return item:GetSourceStartTime() end)
-try("GetSourceEndTime", function() return item:GetSourceEndTime() end)
-
-print("-- メディアプール --")
-local mpi = item:GetMediaPoolItem()
-if mpi then
-    local props = mpi:GetClipProperty()
-    for _, k in ipairs({ "File Path", "Resolution", "FPS", "Frames", "Duration" }) do
-        print(string.format("  %-22s = %s", k, tostring(props[k])))
+print("========== R2AE 診断（読み取り専用） ==========")
+dump("Resolve version", function() return resolve:GetVersionString() end)
+dump("Project settings", function() return project:GetSetting() end)
+dump("Timeline settings", function() return timeline:GetSetting() end)
+dump("Timeline start TC", function() return timeline:GetStartTimecode() end)
+dump("Timeline start frame", function() return timeline:GetStartFrame() end)
+dump("Timeline end frame", function() return timeline:GetEndFrame() end)
+dump("Timeline IN/OUT", function() return timeline:GetMarkInOut() end)
+local item = timeline:GetCurrentVideoItem()
+if item then
+    dump("Clip name", function() return item:GetName() end)
+    dump("Start / End / Duration (subframes)", function()
+        return {start=item:GetStart(true),finish=item:GetEnd(true),duration=item:GetDuration(true)}
+    end)
+    for _, method in ipairs({"GetLeftOffset", "GetRightOffset", "GetSourceStartFrame",
+        "GetSourceEndFrame", "GetSourceStartTime", "GetSourceEndTime", "GetProperty"}) do
+        dump(method, function() return item[method](item) end)
     end
+    local mpi = item:GetMediaPoolItem()
+    if mpi then dump("Media pool properties (all)", function() return mpi:GetClipProperty() end) end
 else
-    print("  メディアプールアイテムなし")
+    print("再生ヘッド位置に映像なし。タイムライン設定だけ出力しました")
 end
-
-print("-- GetProperty() 全ダンプ --")
-local ok, p = pcall(function() return item:GetProperty() end)
-if ok and type(p) == "table" then
-    local keys = {}
-    for k in pairs(p) do table.insert(keys, tostring(k)) end
-    table.sort(keys)
-    for _, k in ipairs(keys) do
-        print(string.format("  %-22s = %s", k, tostring(p[k])))
-    end
-else
-    print("  GetProperty() が使えません")
-end
-
-print("-- リタイム関連 --")
-try("GetIsColorOutputCacheEnabled", function()
-    return item:GetIsColorOutputCacheEnabled()
-end)
-try("GetRetimeCurve", function() return item:GetRetimeCurve() end)
-
-print("==================================")
+print("============================================")

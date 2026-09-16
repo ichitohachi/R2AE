@@ -39,10 +39,16 @@ local JSX_PATH = BRIDGE_DIR .. "/r2ae_receive.jsx"
 -- ---- 設定 ---------------------------------------------------------------
 
 -- オーディオの扱い
---   "auto"       : リンク音声は映像レイヤーの音を使う。ズレている場合のみ別レイヤー化
+--   "auto"       : 同じ素材・配置・トリム・速度のAをVへ統合（既定）
 --   "video_only" : Aトラックのうち映像と同一ファイルのものは常に捨てる
---   "separate"   : 常にAトラックを別レイヤーにし、映像側の音声はオフ
+--   "separate"   : 常にAトラックを別レイヤーにし、全映像レイヤーの音声はオフ
 local AUDIO_MODE = "auto"
+-- 同位置でも別チャンネル/意図した重ね録りの可能性があるため、既定では統合しない
+local DEDUPE_AUDIO = false
+-- GetMarkInOut の座標系を明示。バージョン実測で絶対値の場合だけ変更
+local MARK_COORDINATES = "relative"
+-- インターレースでAPIのfpsがフィールド数を返す場合、実測したフレーム数/秒を指定
+local TIMELINE_FRAME_RATE_OVERRIDE = nil
 
 -- 入力スケーリング（プロジェクト設定「解像度が一致しないファイル」に合わせる）
 --   "fit"     : 最長辺をマッチ / 黒帯を挿入（内接フィット）
@@ -73,13 +79,19 @@ local function file_exists(path)
     return false
 end
 
+local function shell_quote(text)
+    return "'" .. text:gsub("'", "'\\''") .. "'"
+end
+local function apple_quote(text)
+    return '"' .. text:gsub("\\", "\\\\"):gsub('"', '\\"') .. '"'
+end
 local function ensure_dir(path)
     if IS_WINDOWS then
         -- Windowsのmkdirは "/" 区切りを受け付けないため "\" に変換する
         local winPath = path:gsub("/", "\\")
         os.execute('if not exist "' .. winPath .. '" mkdir "' .. winPath .. '"')
     else
-        os.execute('mkdir -p "' .. path .. '"')
+        os.execute('mkdir -p ' .. shell_quote(path))
     end
 end
 
@@ -88,6 +100,9 @@ local function json_escape(s)
     s = tostring(s)
     s = s:gsub("\\", "\\\\")
     s = s:gsub('"', '\\"')
+    s = s:gsub("[%z\1-\31]", function(c)
+        return string.format("\\u%04x", string.byte(c))
+    end)
     return s
 end
 
@@ -137,26 +152,107 @@ if not project then print("プロジェクトが開かれていません") retur
 local timeline = project:GetCurrentTimeline()
 if not timeline then print("タイムラインが開かれていません") return end
 
-local fps = tonumber(project:GetSetting("timelineFrameRate")) or 24
-
--- タイムライン解像度をコンプサイズに使う
-local compW = tonumber(project:GetSetting("timelineResolutionWidth")) or 1920
-local compH = tonumber(project:GetSetting("timelineResolutionHeight")) or 1080
+-- 設定は現在のタイムラインを優先。未公開のキーを推測せずスナップショットを読む。
+local warnings = {}
+local function warn(message)
+    for _, existing in ipairs(warnings) do if existing == message then return end end
+    warnings[#warnings + 1] = message
+    print("R2AE: " .. message)
+end
+local function settings(object)
+    local ok, value = pcall(function() return object:GetSetting() end)
+    return ok and type(value) == "table" and value or {}
+end
+local projectSettings, timelineSettings = settings(project), settings(timeline)
+local function setting(key)
+    local v = timelineSettings[key]
+    if v ~= nil and v ~= "" then return v end
+    return projectSettings[key]
+end
+local function as_bool(v)
+    if v == true or v == 1 or v == "1" or v == "true" then return true end
+    if v == false or v == 0 or v == "0" or v == "false" then return false end
+    return nil
+end
+local function parse_fps(value)
+    local text = tostring(value or "")
+    local n, d = text:match("^%s*(%d+)%s*/%s*(%d+)%s*$")
+    local rate
+    if n then
+        if tonumber(d) == 0 then return nil end
+        rate = tonumber(n) / tonumber(d)
+    else
+        local digits, suffix = text:match("^%s*(%d+%.?%d*)%s*(%a*)%s*$")
+        suffix = (suffix or ""):upper()
+        if suffix ~= "" and suffix ~= "DF" and suffix ~= "NDF" then return nil end
+        rate = tonumber(digits)
+    end
+    if not rate or rate <= 0 then return nil end
+    -- UIの省略表記を実レートに正規化。整数の24/30/60とは区別する。
+    local ntsc = { [23.976] = 24000/1001, [23.98] = 24000/1001,
+        [29.97] = 30000/1001, [47.952] = 48000/1001,
+        [59.94] = 60000/1001, [119.88] = 120000/1001 }
+    return ntsc[rate] or rate
+end
+local fpsRaw = setting("timelineFrameRate")
+local fps = parse_fps(TIMELINE_FRAME_RATE_OVERRIDE or fpsRaw)
+local compW = tonumber(setting("timelineResolutionWidth"))
+local compH = tonumber(setting("timelineResolutionHeight"))
+if not fps or not compW or compW <= 0 or not compH or compH <= 0 then
+    print("R2AE: タイムラインのfps/解像度を取得できません。推測で転送せず終了します")
+    return
+end
+-- Resolve exposes this as timelineInterlaceProcessing (verified in Resolve).
+local interlaced = as_bool(setting("timelineInterlaceProcessing"))
+-- Resolve's interlaced 50/59.94/60 timelines count fields in item and mark APIs.
+-- Keep fps as the API clock for source trimming/speed; convert only exported
+-- timeline coordinates to full-frame composition units.
+local ticksPerFrame = (interlaced and fps >= 49) and 2 or 1
+local compFps = fps / ticksPerFrame
+local startTC = timeline:GetStartTimecode() or ""
+local dropFrame = as_bool(setting("timelineDropFrameTimecode"))
+if dropFrame == nil then
+    dropFrame = tostring(fpsRaw):upper():match("%sDF%s*$") ~= nil
+        or startTC:find(";", 1, true) ~= nil
+end
+local pixelRaw = setting("timelinePixelAspectRatio")
+local pixelAspect = tonumber(pixelRaw)
+if not pixelAspect then
+    pixelAspect = 1
+    if pixelRaw and pixelRaw ~= "Square" and pixelRaw ~= "square" then
+        warn("ピクセル縦横比を解釈できません: " .. tostring(pixelRaw) .. "（正方形として転送）")
+    end
+end
+if interlaced then
+    warn("インターレース: AEのコンポにはフィールド順の設定はありません。素材のフィールド分離と出力時のField Renderingを確認してください")
+elseif interlaced == nil then
+    warn("タイムラインのインターレース設定をAPIから取得できません。r2ae_debugで確認してください")
+end
 
 -- 送信範囲（IN/OUT）を取得する。rangeOut は排他的（その値のフレームは含まない）
 local function get_mark_in_out()
     local ok, mio = pcall(function() return timeline:GetMarkInOut() end)
     if not ok or type(mio) ~= "table" then return nil end
 
-    local r = mio.video or mio.audio
-    if not (r and r["in"] and r["out"]) then return nil end
-
-    local tlStart = timeline:GetStartFrame() or 0
-    local a, b = r["in"], r["out"]
-    -- タイムライン先頭からの相対値で返る場合があるので補正
-    if a < tlStart then
-        a = a + tlStart
-        b = b + tlStart
+    local function complete(r)
+        return type(r) == "table" and tonumber(r["in"]) and tonumber(r["out"])
+    end
+    local v, au = mio.video, mio.audio
+    if complete(v) and complete(au) and
+        (v["in"] ~= au["in"] or v["out"] ~= au["out"]) then
+        print("映像と音声のIN/OUTが異なります。同じ範囲に設定してください")
+        return nil
+    end
+    local r = complete(v) and v or (complete(au) and au or nil)
+    if not r then return nil end
+    local a, b = tonumber(r["in"]), tonumber(r["out"])
+    if a < 0 or b < a then return nil end
+    -- 数値の大小による推測は、長いタイムラインで座標を誤認する。
+    if MARK_COORDINATES == "relative" then
+        local tlStart = timeline:GetStartFrame() or 0
+        a, b = a + tlStart, b + tlStart
+    elseif MARK_COORDINATES ~= "absolute" then
+        error("MARK_COORDINATES は relative / absolute を指定してください")
     end
     return a, b + 1
 end
@@ -250,7 +346,7 @@ local function get_speed(item, props)
 
     -- 素材fpsとタイムラインfpsが異なる場合、Resolveがコンフォームするため
     -- フレーム数の比だけでは速度と区別がつかない。fps比で割り戻す。
-    local srcFps = tonumber(props and props["FPS"])
+    local srcFps = parse_fps(props and props["FPS"])
     local conform = 1
     if srcFps and srcFps > 0 and fps and fps > 0 then
         conform = srcFps / fps
@@ -259,8 +355,9 @@ local function get_speed(item, props)
     local sp = used / (dur * conform)
 
     -- 誤差程度の差は等速とみなす
-    if math.abs(sp - 1) < 0.02 then
-        return 1, nil
+    if math.abs(used - dur * conform) <= 1 then
+        sp = 1
+        if not reverse then return 1, nil end
     end
     if reverse then sp = -sp end
 
@@ -277,8 +374,8 @@ local function collect_track(trackType, trackIndex)
     local items = timeline:GetItemListInTrack(trackType, trackIndex)
     if not items then return end
     for _, item in ipairs(items) do
-        local s = item:GetStart()
-        local e = item:GetEnd()
+        local s = item:GetStart(true)
+        local e = item:GetEnd(true)
         if s < rangeOut and e > rangeIn then
             if not is_clip_enabled(item) then
                 disabledClips = disabledClips + 1
@@ -301,18 +398,19 @@ local function collect_track(trackType, trackIndex)
                         end
 
                         local speed = 1
-                        if ENABLE_SPEED and trackType == "video" then
+                        if ENABLE_SPEED and parse_fps(props["FPS"]) then
                             local sp, info = get_speed(item, props)
                             speed = sp
                             if info then
                                 print(string.format("  [retime] %s : %s",
                                     item:GetName(), info))
+                                warn(item:GetName() .. ": 速度はAPIフレーム範囲からの推定です。" .. info)
                             end
                         end
 
                         -- 素材fps。source_in は素材フレーム基準の値なので、
                         -- タイムラインfpsと異なる場合の換算に必要（AE側で使う）
-                        local srcFps = tonumber(props["FPS"])
+                        local srcFps = parse_fps(props["FPS"])
                         if not srcFps or srcFps <= 0 then srcFps = nil end
 
                         -- 範囲からはみ出した分を切り詰める
@@ -343,6 +441,9 @@ local function collect_track(trackType, trackIndex)
                             mute_audio = false,
                             speed = speed,
                             src_fps = srcFps,
+                            src_fps_raw = tostring(props["FPS"] or ""),
+                            src_start_tc = tostring(props["Start TC"] or ""),
+                            src_field = tostring(props["Field Dominance"] or ""),
                             src_w = sw,
                             src_h = sh,
                             is_sequence = isSequence,
@@ -413,50 +514,55 @@ local function dedupe_audio(list)
 end
 
 local function resolve_audio_duplicates(list)
-    if AUDIO_MODE == "separate" then
-        for _, a in ipairs(list) do
-            if a.kind == "audio" then
-                for _, v in ipairs(list) do
-                    if v.kind == "video" and v.path == a.path then
-                        v.mute_audio = true
-                    end
-                end
-            end
-        end
-        return list, 0
+    local function same_number(a, b)
+        return type(a) == "number" and type(b) == "number" and math.abs(a - b) < 0.000001
     end
-
-    local kept = {}
-    local merged = 0
+    local function same_timing(a, b)
+        return a.path == b.path and same_number(a.start, b.start)
+            and same_number(a.duration, b.duration)
+            and same_number(a.source_in, b.source_in)
+            and same_number(a.speed or 1, b.speed or 1)
+            and same_number(a.src_fps or fps, b.src_fps or fps)
+            and a.is_sequence == b.is_sequence
+    end
+    -- Start muted: only an enabled, collected A item can restore embedded sound.
+    for _, c in ipairs(list) do
+        if c.kind == "video" then c.mute_audio = AUDIO_MODE ~= "video_only" end
+    end
+    local kept, merged = {}, 0
     for _, c in ipairs(list) do
         local drop = false
-        if c.kind == "audio" then
-            for _, v in ipairs(list) do
-                if v.kind == "video" and v.path == c.path then
-                    if AUDIO_MODE == "video_only" then
+        if c.kind == "audio" and AUDIO_MODE == "auto" then
+            -- Multiple identical A items may represent channel splits or intentional
+            -- layering. Do not collapse those without channel mapping information.
+            local count = 0
+            for _, a in ipairs(list) do
+                if a.kind == "audio" and same_timing(c, a) then count = count + 1 end
+            end
+            if count == 1 then
+                for _, v in ipairs(list) do
+                    if v.kind == "video" and v.mute_audio and same_timing(c, v) then
+                        v.mute_audio = false
                         drop = true
-                    elseif c.start == v.start
-                        and c.duration == v.duration
-                        and c.source_in == v.source_in then
-                        -- 完全にリンクした音声。映像レイヤーの音をそのまま使う
-                        drop = true
-                    else
-                        -- ズレているので独立レイヤーとして残し、映像側を消音
-                        v.mute_audio = true
+                        break -- One A item enables only one V instance.
                     end
                 end
             end
+        elseif c.kind == "audio" and AUDIO_MODE == "video_only" then
+            for _, v in ipairs(list) do
+                if v.kind == "video" and v.path == c.path then drop = true break end
+            end
         end
-        if drop then
-            merged = merged + 1
-        else
-            table.insert(kept, c)
-        end
+        if drop then merged = merged + 1 else table.insert(kept, c) end
     end
     return kept, merged
 end
 
-local dedupedList, dupeCount = dedupe_audio(collected)
+local dedupedList, dupeCount = collected, 0
+if DEDUPE_AUDIO then dedupedList, dupeCount = dedupe_audio(collected) end
+if audioTracks > 0 then
+    warn("音量・パン・チャンネル割当・Fairlight処理は未転送です。分割モノ音声はAEでチャンネルを確認してください")
+end
 local finalList, mergedCount = resolve_audio_duplicates(dedupedList)
 
 -- コンプ範囲はマークしたIN/OUTをそのまま使う
@@ -469,7 +575,8 @@ ensure_dir(BRIDGE_DIR)
 
 local parts = {}
 for _, c in ipairs(finalList) do
-    local extra = ""
+    local extra = string.format(', "src_fps_raw": "%s", "src_start_tc": "%s", "src_field": "%s"',
+        json_escape(c.src_fps_raw), json_escape(c.src_start_tc), json_escape(c.src_field))
     if c.src_fps then
         extra = extra .. string.format(', "src_fps": %s', tostring(c.src_fps))
     end
@@ -493,34 +600,57 @@ for _, c in ipairs(finalList) do
     end
     table.insert(parts, string.format(
         '    {"name": "%s", "path": "%s", "kind": "%s", "track": %d, ' ..
-        '"offset": %d, "duration": %d, "source_in": %.6f, "mute_audio": %s, ' ..
+        '"offset": %.10f, "duration": %.10f, "source_in": %.6f, "mute_audio": %s, ' ..
         '"speed": %s%s}',
         json_escape(c.name), json_escape(c.path), c.kind, c.track,
-        c.start - minStart, c.duration, c.source_in,
+        (c.start - minStart) / ticksPerFrame, c.duration / ticksPerFrame, c.source_in,
         tostring(c.mute_audio == true), tostring(c.speed or 1), extra
     ))
 end
 
+local warningJSON = {}
+for _, message in ipairs(warnings) do
+    warningJSON[#warningJSON + 1] = '"' .. json_escape(message) .. '"'
+end
 local json = string.format(
 [[{
+  "schema_version": 2,
   "comp_name": "%s",
   "width": %d,
   "height": %d,
   "fps": %s,
-  "duration": %d,
+  "duration": %.10f,
   "input_scaling": "%s",
+  "drop_frame": %s,
+  "display_start_frame": %s,
+  "display_start_time": %.10f,
+  "resolve_clock_fps": %s,
+  "resolve_ticks_per_frame": %d,
+  "pixel_aspect": %s,
+  "interlaced": %s,
+  "fps_raw": "%s",
+  "warnings": [%s],
   "clips": [
 %s
   ]
 }]],
     json_escape(timeline:GetName() .. "_AE"),
-    compW, compH, tostring(fps), totalDuration, INPUT_SCALING,
+    compW, compH, tostring(compFps), totalDuration / ticksPerFrame, INPUT_SCALING,
+    tostring(dropFrame), rangeIn % ticksPerFrame == 0 and tostring(rangeIn / ticksPerFrame) or "null",
+    rangeIn / fps, tostring(fps), ticksPerFrame, tostring(pixelAspect),
+    interlaced == nil and "null" or tostring(interlaced), json_escape(fpsRaw),
+    table.concat(warningJSON, ","),
     table.concat(parts, ",\n")
 )
 
-local f = io.open(JSON_PATH, "w")
-f:write(json)
-f:close()
+local f, writeError = io.open(JSON_PATH, "w")
+if not f then print("JSONを開けません: " .. tostring(writeError)) return end
+local written, writeMessage = f:write(json)
+local closed, closeMessage = f:close()
+if not written or not closed then
+    print("JSONの保存に失敗: " .. tostring(writeMessage or closeMessage))
+    return
+end
 
 print(string.format(
     "範囲: %d - %d / 収集: %d クリップ / 分割音声を統合: %d / " ..
@@ -540,7 +670,6 @@ local sent = false
 if IS_WINDOWS then
     -- Windows: 起動中のAfter Effectsへ AfterFX.exe -r でJSXを送る。
     -- COMは使用しない。AfterFX.exeのパス取得だけPowerShellを使用する。
-    -- Mac側の処理は変更しない。
     local jsxWin = JSX_PATH:gsub("/", "\\")
 
     -- 現在起動しているAfterFX.exeの実パスを取得する。
@@ -574,16 +703,15 @@ if IS_WINDOWS then
         -- cmd.exe経由で単純に AfterFX.exe -r "JSX" を実行する。
         -- パス中の & などの特殊文字対策として引用符で囲む。
         -- CMDで実際に動作確認できた形式に合わせる。
-        -- AfterFX.exe は引用符で囲むが、JSXパスは引用符で囲まない。
-        -- （今回のDocuments\ae_bridge配下のパスにはスペースがないため）
+        -- ユーザー名にスペースがある環境でもJSXパスを1つの引数として渡す。
         local cmd = string.format(
-            'cmd.exe /d /c ""%s" -r %s"',
+            'cmd.exe /d /c ""%s" -r "%s""',
             afterfx:gsub('"', '""'),
             jsxWin:gsub('"', '""')
         )
 
         local result = os.execute(cmd)
-        sent = result ~= nil
+        sent = result == true or result == 0
 
         if sent then
             print("R2AE: Windows / 起動中のAEへJSXを送信しました")
@@ -602,12 +730,11 @@ else
         print("After Effectsが見つかりません")
         return
     end
-    local cmd = string.format(
-        'osascript -e \'tell application "%s" to activate\' ' ..
-        '-e \'tell application "%s" to DoScriptFile POSIX file "%s"\'',
-        aeName, aeName, JSX_PATH
-    )
-    sent = os.execute(cmd) and true or false
+    local cmd = "osascript -e " .. shell_quote("tell application " .. apple_quote(aeName) .. " to activate")
+        .. " -e " .. shell_quote("tell application " .. apple_quote(aeName)
+        .. " to DoScriptFile POSIX file " .. apple_quote(JSX_PATH))
+    local result = os.execute(cmd)
+    sent = result == true or result == 0
 end
 
 if not IS_WINDOWS then

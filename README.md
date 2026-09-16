@@ -1,5 +1,7 @@
 # R2AE
 
+> Review revision, 2026-09-14. Thirty-four Lua/AE mock-host regression tests pass (including a fix for the Transform property hierarchy regression); this revision has not been tested end to end in Resolve and After Effects. Update both scripts together. See [REVIEW.ja.md](REVIEW.ja.md) for findings and the integration test matrix.
+
 **[日本語 README](README.ja.md)**
 
 A bridge script that sends clips from a DaVinci Resolve timeline to After Effects, reproducing their placement, scale, position, rotation, anchor point, speed, and audio.
@@ -14,12 +16,12 @@ This is not a persistent link like Adobe Dynamic Link. Each time you run it, the
 
 - Sends all clips overlapping the timeline's IN/OUT range in one go (clips crossing the range boundary are trimmed at the edge)
 - Supports multiple tracks (video and audio). Respects track-level and clip-level enable/disable
-- Matches the composition resolution to the timeline settings
+- Transfers current timeline resolution, fps, DF/NDF display and the IN mark as composition start timecode
 - Converts each clip's Zoom, Pan/Tilt, Rotation, Anchor Point, Flip, and Opacity into AE's Scale / Position / Rotation / Anchor Point / Opacity
 - Reproduces constant-speed retiming via AE's Time Remap, with a check to avoid misreading frame-rate conforms as speed changes
-- Merges duplicate audio when stereo is split across L/R tracks
+- Keeps A tracks as independent audio layers; optional deduplication does not verify channel mapping
 - Prevents double playback of audio linked to a video clip
-- Reuses already-imported footage (sending the same file multiple times won't create duplicates in the Project panel)
+- Reuses matching footage within a transfer; subsequent transfers import fresh footage to isolate interpretation settings
 
 ## What it doesn't do
 
@@ -40,6 +42,8 @@ Testing has been done on macOS with DaVinci Resolve and After Effects 2026.
 
 - **macOS**: Uses AppleScript to tell After Effects to run the script directly. No setup beyond installing the two files is needed — running `r2ae` is enough.
 - **Windows**: Detects the running After Effects process and calls `AfterFX.exe -r` to run the script directly against it. **After Effects needs to already be running** — if it isn't, R2AE doesn't launch it automatically; the Resolve console says so, and the JSON is left written for you to pick up once you've opened After Effects and run `r2ae` again. If multiple AE versions are installed, the clips go to whichever version is currently running.
+
+Windows update instructions: [WINDOWS.ja.md](WINDOWS.ja.md) (Japanese).
 
 ## Installation
 
@@ -88,7 +92,7 @@ Behavior can be changed via variables at the top of `r2ae.lua`.
 
 | Variable | Description |
 |---|---|
-| `AUDIO_MODE` | `"auto"` (default) / `"video_only"` / `"separate"` — how linked audio is handled |
+| `AUDIO_MODE` | `"auto"` (default; merges matching A/V items) / `"separate"` (independent audio layers) / `"video_only"` (uses embedded video audio) |
 | `INPUT_SCALING` | `"fit"` (default) / `"fill"` / `"stretch"` / `"none"` — should match Resolve's project setting for "Input Sizing Preset" |
 | `ROTATION_SIGN` | `1` / `-1` (default) — corrects rotation direction |
 | `ENABLE_SPEED` | `true` (default) — whether speed changes are reflected as Time Remap |
@@ -107,6 +111,14 @@ After that, there is no remaining connection between the two applications.
 ## About the transform conversion
 
 Resolve's inspector values (Zoom / Pan / Tilt / Anchor Point / Rotation) live in a coordinate system shaped by the timeline resolution, the source resolution, and the project's input scaling setting. In particular, Anchor Point in Resolve behaves as a pivot rather than a simple offset — moving it also moves the clip's on-screen position. This tool derives the conversion formulas from measured, real-world values (see the comments in `r2ae.lua` for details).
+
+## Timing and interpretation in this revision
+
+Movies keep the fps interpreted by AE's importer; image sequences use their Resolve source fps. A different Resolve clip interpretation rate is represented by layer retiming. DF is timecode numbering, not frame removal. Composition DF is explicitly set; source DF and Resolve-only source timecode overrides are not guaranteed. Source timecode and FPS metadata are recorded in comments.
+
+Recognized source Field Dominance values set AE field separation. Unknown values retain importer interpretation and produce a notice. Field rendering is an output setting and must be configured separately. The verified setting key is `timelineInterlaceProcessing`. Interlaced API rates >= 49 use field ticks: composition fps and timeline coordinates are divided by two together, preserving elapsed seconds; source trimming still uses the original API clock. Progressive 59.94 fps remains unchanged. The Resolve API values were read live; the updated AE composition has not yet been verified live. `MARK_COORDINATES` defaults to `"relative"`; use `"absolute"` only if verified for the Resolve version.
+
+In auto mode, matching source, timing, trim and speed allow one A item to enable embedded audio on one video layer. Unmatched audio stays separate; video without a matching A item stays muted. `DEDUPE_AUDIO` defaults to false. Channel mapping, volume, pan, Fairlight processing, pitch preservation and sample-accurate audio trims are unsupported. Retime estimation, field interpretation, non-square-pixel transforms, freezes, VFR and Optical Flow still require real application verification. See the Japanese review for the test matrix.
 
 ## Known limitations
 
