@@ -9,8 +9,7 @@
 --       Windows : %USERPROFILE%\Documents\ae_bridge\
 --
 -- 動作:
---   タイムラインに設定したIN/OUT範囲に重なる全トラック(V/A)のクリップを
---   まとめてAEへ送る。範囲からはみ出した分は切り詰められる。
+--   Editページで選択したクリップをAEへ送る（Resolve 21.0.4以降）。
 --   コンプ解像度とクリップのスケール/位置はResolve側の見た目に合わせる。
 --
 -- AEへの送信方式はOSによって異なる:
@@ -40,22 +39,19 @@ local JSX_PATH = BRIDGE_DIR .. "/r2ae_receive.jsx"
 
 -- オーディオの扱い
 --   "auto"       : 同じ素材・配置・トリム・速度のAをVへ統合（既定）
---   "video_only" : Aトラックのうち映像と同一ファイルのものは常に捨てる
 --   "separate"   : 常にAトラックを別レイヤーにし、全映像レイヤーの音声はオフ
 local AUDIO_MODE = "auto"
 -- 同位置でも別チャンネル/意図した重ね録りの可能性があるため、既定では統合しない
 local DEDUPE_AUDIO = false
--- GetMarkInOut の座標系を明示。バージョン実測で絶対値の場合だけ変更
-local MARK_COORDINATES = "relative"
 -- インターレースでAPIのfpsがフィールド数を返す場合、実測したフレーム数/秒を指定
 local TIMELINE_FRAME_RATE_OVERRIDE = nil
 
--- 入力スケーリング（プロジェクト設定「解像度が一致しないファイル」に合わせる）
+-- 入力スケーリング（"auto" は現在のタイムライン設定を使用）
 --   "fit"     : 最長辺をマッチ / 黒帯を挿入（内接フィット）
 --   "fill"    : 最短辺をマッチ / 画像を切り抜き（外接フィット）
 --   "stretch" : フレームに合わせて引き伸ばし
 --   "none"    : 中央に原寸配置
-local INPUT_SCALING = "fit"
+local INPUT_SCALING = "auto"
 
 -- Resolveの回転方向がAEと逆になる場合は -1 にする
 -- （実測により既定を -1 にしている）
@@ -63,6 +59,9 @@ local ROTATION_SIGN = -1
 
 -- 速度変更（リタイム）をAEのタイムリマップに反映するか
 local ENABLE_SPEED = true
+
+-- macOS: ResolveのFCPXMLからエディットページの変形キーを取得する
+local ENABLE_TRANSFORM_KEYFRAMES = true
 
 -- 無効化されたトラックを送信対象から除外するか
 local RESPECT_TRACK_ENABLE = true
@@ -217,10 +216,19 @@ if dropFrame == nil then
 end
 local pixelRaw = setting("timelinePixelAspectRatio")
 local pixelAspect = tonumber(pixelRaw)
-if not pixelAspect then
+if not pixelAspect or pixelAspect <= 0 then
     pixelAspect = 1
     if pixelRaw and pixelRaw ~= "Square" and pixelRaw ~= "square" then
         warn("ピクセル縦横比を解釈できません: " .. tostring(pixelRaw) .. "（正方形として転送）")
+    end
+end
+local inputScaling = INPUT_SCALING
+if inputScaling == "auto" then
+    local scalingModes = { scaleToFit = "fit", scaleToCrop = "fill", stretch = "stretch", centerCrop = "none" }
+    local raw = setting("timelineInputResMismatchBehavior")
+    inputScaling = scalingModes[raw] or "fit"
+    if raw and not scalingModes[raw] then
+        warn("入力スケーリングを解釈できません: " .. tostring(raw) .. "（fitで転送）")
     end
 end
 if interlaced then
@@ -229,43 +237,35 @@ elseif interlaced == nil then
     warn("タイムラインのインターレース設定をAPIから取得できません。r2ae_debugで確認してください")
 end
 
--- 送信範囲（IN/OUT）を取得する。rangeOut は排他的（その値のフレームは含まない）
-local function get_mark_in_out()
-    local ok, mio = pcall(function() return timeline:GetMarkInOut() end)
-    if not ok or type(mio) ~= "table" then return nil end
-
-    local function complete(r)
-        return type(r) == "table" and tonumber(r["in"]) and tonumber(r["out"])
-    end
-    local v, au = mio.video, mio.audio
-    if complete(v) and complete(au) and
-        (v["in"] ~= au["in"] or v["out"] ~= au["out"]) then
-        print("映像と音声のIN/OUTが異なります。同じ範囲に設定してください")
-        return nil
-    end
-    local r = complete(v) and v or (complete(au) and au or nil)
-    if not r then return nil end
-    local a, b = tonumber(r["in"]), tonumber(r["out"])
-    if a < 0 or b < a then return nil end
-    -- 数値の大小による推測は、長いタイムラインで座標を誤認する。
-    if MARK_COORDINATES == "relative" then
-        local tlStart = timeline:GetStartFrame() or 0
-        a, b = a + tlStart, b + tlStart
-    elseif MARK_COORDINATES ~= "absolute" then
-        error("MARK_COORDINATES は relative / absolute を指定してください")
-    end
-    return a, b + 1
+-- Resolveの選択をトラックごとに分け、AEでのレイヤー順を維持する。
+if not timeline.GetSelectedClips then
+    print("R2AE: 選択転送にはResolve 21.0.4以降が必要です")
+    return
 end
-
-local rangeIn, rangeOut = get_mark_in_out()
-if not rangeIn then
-    print("タイムラインにIN/OUTが設定されていません（I / O キーで範囲を指定してください）")
+local ok, items = pcall(function() return timeline:GetSelectedClips() end)
+if not ok or type(items) ~= "table" then
+    print("R2AE: タイムラインの選択を取得できませんでした")
+    return
+end
+if #items == 0 then
+    print("R2AE: Editページのタイムライン上で送信するクリップを選択してください")
     return
 end
 
--- 送信範囲に重なるクリップを収集する
 local collected = {}
 local skipped = 0
+local selectedTracks = { audio = {}, video = {} }
+for _, item in ipairs(items) do
+    local track = item:GetTrackTypeAndIndex()
+    local tracks = type(track) == "table" and selectedTracks[track[1]]
+    local index = tracks and tonumber(track[2])
+    if index and index >= 1 then
+        tracks[index] = tracks[index] or {}
+        table.insert(tracks[index], item)
+    else
+        skipped = skipped + 1
+    end
+end
 
 -- 無効トラックを除外する（古いバージョンでAPIが無い場合は常に有効扱い）
 local disabledTracks = 0
@@ -367,16 +367,16 @@ local function get_speed(item, props)
 end
 
 local function collect_track(trackType, trackIndex)
+    local items = selectedTracks[trackType][trackIndex]
+    if not items then return end
     if not is_track_enabled(trackType, trackIndex) then
         disabledTracks = disabledTracks + 1
         return
     end
-    local items = timeline:GetItemListInTrack(trackType, trackIndex)
-    if not items then return end
     for _, item in ipairs(items) do
         local s = item:GetStart(true)
         local e = item:GetEnd(true)
-        if s < rangeOut and e > rangeIn then
+        if e > s then
             if not is_clip_enabled(item) then
                 disabledClips = disabledClips + 1
             else
@@ -413,15 +413,6 @@ local function collect_track(trackType, trackIndex)
                         local srcFps = parse_fps(props["FPS"])
                         if not srcFps or srcFps <= 0 then srcFps = nil end
 
-                        -- 範囲からはみ出した分を切り詰める
-                        -- リタイム中は素材側の進み方も倍率に従う
-                        -- 切り詰め量はタイムラインフレーム数なので、
-                        -- fps比（コンフォーム）を掛けて素材フレームに換算する
-                        local cs = math.max(s, rangeIn)
-                        local ce = math.min(e, rangeOut)
-                        local conform = (srcFps and fps > 0) and (srcFps / fps) or 1
-                        sourceIn = sourceIn + (cs - s) * speed * conform
-
                         -- 素材解像度（スケール計算に使う）
                         local sw, sh = nil, nil
                         local resStr = props["Resolution"]
@@ -435,8 +426,8 @@ local function collect_track(trackType, trackIndex)
                             path = path,
                             kind = trackType,
                             track = trackIndex,
-                            start = cs,
-                            duration = ce - cs,
+                            start = s,
+                            duration = e - s,
                             source_in = sourceIn,
                             mute_audio = false,
                             speed = speed,
@@ -478,7 +469,7 @@ if #collected == 0 then
             "対象クリップがありません（無効トラック %d 本 / 無効クリップ %d 本を除外）",
             disabledTracks, disabledClips))
     else
-        print("IN/OUT範囲にクリップがありません")
+        print("R2AE: 選択したクリップに転送可能な映像・音声素材がありません")
     end
     return
 end
@@ -527,7 +518,7 @@ local function resolve_audio_duplicates(list)
     end
     -- Start muted: only an enabled, collected A item can restore embedded sound.
     for _, c in ipairs(list) do
-        if c.kind == "video" then c.mute_audio = AUDIO_MODE ~= "video_only" end
+        if c.kind == "video" then c.mute_audio = true end
     end
     local kept, merged = {}, 0
     for _, c in ipairs(list) do
@@ -548,10 +539,6 @@ local function resolve_audio_duplicates(list)
                     end
                 end
             end
-        elseif c.kind == "audio" and AUDIO_MODE == "video_only" then
-            for _, v in ipairs(list) do
-                if v.kind == "video" and v.path == c.path then drop = true break end
-            end
         end
         if drop then merged = merged + 1 else table.insert(kept, c) end
     end
@@ -560,14 +547,174 @@ end
 
 local dedupedList, dupeCount = collected, 0
 if DEDUPE_AUDIO then dedupedList, dupeCount = dedupe_audio(collected) end
-if audioTracks > 0 then
+if next(selectedTracks.audio) then
     warn("音量・パン・チャンネル割当・Fairlight処理は未転送です。分割モノ音声はAEでチャンネルを確認してください")
 end
 local finalList, mergedCount = resolve_audio_duplicates(dedupedList)
 
--- コンプ範囲はマークしたIN/OUTをそのまま使う
-local minStart, maxEnd = rangeIn, rangeOut
+-- 転送する素材の最初から最後までをコンプ範囲にする。
+local minStart, maxEnd = finalList[1].start, finalList[1].start + finalList[1].duration
+for _, c in ipairs(finalList) do
+    minStart = math.min(minStart, c.start)
+    maxEnd = math.max(maxEnd, c.start + c.duration)
+end
 local totalDuration = maxEnd - minStart
+
+-- ResolveのFCPXMLを1回だけ書き出し、クリップと変形キーを読み取る。
+-- 元のXMLは一時ファイルで処理し、選択クリップに対応するキーだけをJSONへ渡す。
+local function read_transform_keys(clips)
+    if IS_WINDOWS or not ENABLE_TRANSFORM_KEYFRAMES or not timeline.Export or not resolve.EXPORT_FCPXML_1_9 then
+        return
+    end
+
+    local function clip_id(path, offset, duration)
+        local startFrame = math.floor(offset + 0.5)
+        local frameCount = math.floor(duration + 0.5)
+        if math.abs(startFrame - offset) > 0.01 or math.abs(frameCount - duration) > 0.01 then return nil end
+        return table.concat({startFrame, frameCount, path}, "|")
+    end
+
+    local startFrame = timeline:GetStartFrame()
+    local selected = {}
+    for _, c in ipairs(clips) do
+        if c.kind == "video" and c.transform then
+            local id = clip_id(c.path, c.start - startFrame, c.duration)
+            if id then selected[id] = selected[id] == nil and c or false end
+        end
+    end
+    if not next(selected) then return end
+
+    local tempOK, stylePath = pcall(os.tmpname)
+    if not tempOK or not stylePath then
+        warn("キーフレーム取得用の一時ファイルを作れないため、静的なTransformで転送します")
+        return
+    end
+    local xmlPath = stylePath .. ".fcpxml"
+    local ok, rows = pcall(function()
+        local style = assert(io.open(stylePath, "w"))
+        local written, writeError = style:write([=[
+<xsl:stylesheet version="1.0" xmlns:xsl="http://www.w3.org/1999/XSL/Transform">
+  <xsl:output method="text" encoding="UTF-8"/>
+  <xsl:key name="asset" match="resources/asset" use="@id"/>
+  <xsl:template name="seconds">
+    <xsl:param name="time"/>
+    <xsl:variable name="fraction" select="substring-before($time, 's')"/>
+    <xsl:choose>
+      <xsl:when test="contains($fraction, '/')">
+        <xsl:value-of select="number(substring-before($fraction, '/')) div number(substring-after($fraction, '/'))"/>
+      </xsl:when>
+      <xsl:otherwise><xsl:value-of select="number($fraction)"/></xsl:otherwise>
+    </xsl:choose>
+  </xsl:template>
+  <xsl:template match="/">
+    <xsl:for-each select="/fcpxml/library/event/project/sequence">
+      <xsl:variable name="tcStart"><xsl:call-template name="seconds"><xsl:with-param name="time" select="@tcStart"/></xsl:call-template></xsl:variable>
+      <xsl:text>R2AE&#10;</xsl:text>
+      <xsl:apply-templates select="spine/*" mode="clip">
+        <xsl:with-param name="parentStart" select="number($tcStart)"/>
+      </xsl:apply-templates>
+    </xsl:for-each>
+  </xsl:template>
+  <xsl:template match="asset-clip | clip | ref-clip | mc-clip | sync-clip | gap | spine | video | audio" mode="clip">
+    <xsl:param name="parentStart"/>
+    <xsl:param name="parentOffset" select="0"/>
+    <xsl:variable name="offset"><xsl:call-template name="seconds"><xsl:with-param name="time" select="@offset"/></xsl:call-template></xsl:variable>
+    <xsl:variable name="start"><xsl:call-template name="seconds"><xsl:with-param name="time" select="@start"/></xsl:call-template></xsl:variable>
+    <xsl:variable name="timelineOffset" select="$parentOffset + number($offset) - $parentStart"/>
+    <xsl:variable name="asset" select="key('asset', @ref | video/@ref)"/>
+    <xsl:variable name="path" select="$asset/media-rep[@kind='original-media']/@src | $asset/@src"/>
+    <xsl:if test="(self::asset-clip or self::clip or self::video) and $asset/@hasVideo = '1' and not(@srcEnable = 'audio') and $path">
+      <xsl:variable name="duration"><xsl:call-template name="seconds"><xsl:with-param name="time" select="@duration"/></xsl:call-template></xsl:variable>
+      <xsl:value-of select="concat('clip', '&#9;', $timelineOffset, '&#9;', $duration, '&#9;', $path, '&#10;')"/>
+      <xsl:if test="not(timeMap or adjust-transform/@enabled = '0' or adjust-transform/@enabled = 'false')">
+        <xsl:for-each select="adjust-transform/param[@name='position' or @name='anchor' or @name='rotation' or @name='scale']/keyframeAnimation/keyframe | adjust-blend/param[@name='amount']/keyframeAnimation/keyframe">
+          <xsl:variable name="time"><xsl:call-template name="seconds"><xsl:with-param name="time" select="@time"/></xsl:call-template></xsl:variable>
+          <xsl:value-of select="concat('key', '&#9;', ../../@name, '&#9;', number($time) - number($start), '&#9;', @value, '&#10;')"/>
+        </xsl:for-each>
+      </xsl:if>
+    </xsl:if>
+    <xsl:if test="not(timeMap)">
+      <xsl:apply-templates select="asset-clip | clip | ref-clip | mc-clip | sync-clip | gap | spine | video[@lane] | audio[@lane]" mode="clip">
+        <xsl:with-param name="parentStart" select="number($start)"/>
+        <xsl:with-param name="parentOffset" select="$timelineOffset"/>
+      </xsl:apply-templates>
+    </xsl:if>
+  </xsl:template>
+  <xsl:template match="*" mode="clip"/>
+</xsl:stylesheet>
+]=])
+        local closed, closeError = style:close()
+        assert(written and closed, writeError or closeError)
+        assert(timeline:Export(xmlPath, resolve.EXPORT_FCPXML_1_9, resolve.EXPORT_NONE), "FCPXMLを書き出せません")
+        local cmd = "/usr/bin/xsltproc --nonet " .. shell_quote(stylePath) .. " " .. shell_quote(xmlPath)
+        local pipe = assert(io.popen(cmd, "r"))
+        local result = pipe:read("*a")
+        pipe:close()
+        assert(result and result:sub(1, 5) == "R2AE\n", "FCPXMLを解釈できません")
+        return result
+    end)
+    os.remove(stylePath)
+    os.remove(xmlPath)
+    if not ok then
+        warn("キーフレームの取得に失敗したため、静的なTransformで転送します。" .. tostring(rows))
+        return
+    end
+
+    local conversions = {
+        scale = {1, 1}, position = {compH / 100, compH / 100},
+        anchor = {compH / 100, compH / 100}, rotation = {ROTATION_SIGN}, amount = {100},
+    }
+    local current
+    local animations = {}
+    for line in rows:gmatch("[^\r\n]+") do
+        local record, a, b, value = line:match("^(%a+)\t([^\t]+)\t([^\t]+)\t(.+)$")
+        if record == "clip" then
+            current = nil
+            local urlPath = value:match("^file://(/.*)$") or value:match("^file://localhost(/.*)$")
+            local offset, duration = tonumber(a), tonumber(b)
+            if urlPath and offset and duration then
+                local path = resolve_sequence_path((urlPath:gsub("%%(%x%x)", function(byte)
+                    return string.char(tonumber(byte, 16))
+                end)))
+                local id = clip_id(path, offset * fps, duration * fps)
+                if id and selected[id] ~= nil then
+                    local candidates = animations[id] or {}
+                    current = {}
+                    candidates[#candidates + 1] = current
+                    animations[id] = candidates
+                end
+            end
+        elseif record == "key" and current and conversions[a] then
+            local keyTime = tonumber(b)
+            local x, y = value:match("^(%S+)%s+(%S+)$")
+            local factors = conversions[a]
+            x, y = tonumber(x or value), tonumber(y)
+            if keyTime and x and (#factors == 1 or y) then
+                local keys = current[a] or {}
+                keys[#keys + 1] = {keyTime, x * factors[1], #factors == 2 and y * factors[2] or nil}
+                current[a] = keys
+            end
+        end
+    end
+    for id, candidates in pairs(animations) do
+        for _, animation in ipairs(candidates) do
+            if next(animation) then
+                if selected[id] and #candidates == 1 then
+                    for _, keys in pairs(animation) do
+                        table.sort(keys, function(a, b) return a[1] < b[1] end)
+                    end
+                    selected[id].transform_keys = animation
+                else
+                    -- 同一位置・同一尺の同じ素材はトラックを特定できない。
+                    warn("同じ素材・位置・尺のクリップが重なっているため、該当するキーフレームは転送できません")
+                end
+                break
+            end
+        end
+    end
+end
+
+read_transform_keys(finalList)
 
 -- ---- JSON書き出し --------------------------------------------------------
 
@@ -597,6 +744,17 @@ for _, c in ipairs(finalList) do
             tostring(t.anchor_x), tostring(t.anchor_y),
             tostring(t.flip_x), tostring(t.flip_y), tostring(t.opacity)
         )
+    end
+    if c.transform_keys then
+        local parameters = {}
+        for name, keys in pairs(c.transform_keys) do
+            local entries = {}
+            for _, key in ipairs(keys) do
+                entries[#entries + 1] = "[" .. table.concat(key, ",") .. "]"
+            end
+            parameters[#parameters + 1] = '"' .. name .. '": [' .. table.concat(entries, ",") .. "]"
+        end
+        extra = extra .. ', "transform_keys": {' .. table.concat(parameters, ",") .. "}"
     end
     table.insert(parts, string.format(
         '    {"name": "%s", "path": "%s", "kind": "%s", "track": %d, ' ..
@@ -635,9 +793,9 @@ local json = string.format(
   ]
 }]],
     json_escape(timeline:GetName() .. "_AE"),
-    compW, compH, tostring(compFps), totalDuration / ticksPerFrame, INPUT_SCALING,
-    tostring(dropFrame), rangeIn % ticksPerFrame == 0 and tostring(rangeIn / ticksPerFrame) or "null",
-    rangeIn / fps, tostring(fps), ticksPerFrame, tostring(pixelAspect),
+    compW, compH, tostring(compFps), totalDuration / ticksPerFrame, inputScaling,
+    tostring(dropFrame), minStart % ticksPerFrame == 0 and tostring(minStart / ticksPerFrame) or "null",
+    minStart / fps, tostring(fps), ticksPerFrame, tostring(pixelAspect),
     interlaced == nil and "null" or tostring(interlaced), json_escape(fpsRaw),
     table.concat(warningJSON, ","),
     table.concat(parts, ",\n")
@@ -653,9 +811,9 @@ if not written or not closed then
 end
 
 print(string.format(
-    "範囲: %d - %d / 収集: %d クリップ / 分割音声を統合: %d / " ..
+    "範囲: %.10g - %.10g (終端は含まない) / 収集: %d クリップ / 分割音声を統合: %d / " ..
     "リンク音声を統合: %d / スキップ: %d / 無効トラック除外: %d / 無効クリップ除外: %d",
-    rangeIn, rangeOut - 1,
+    minStart, maxEnd,
     #finalList, dupeCount, mergedCount, skipped, disabledTracks, disabledClips))
 
 -- ---- AE起動 --------------------------------------------------------------

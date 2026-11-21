@@ -137,55 +137,118 @@
         }
     }
 
-    function applyTransform(layer, c, d, footage) {
+    // 曲線ごとに異なるキー時刻を持てる。アンカーと位置を合成するときにも使う。
+    function sampleKeys(keys, time, defaultValue) {
+        if (!keys || !keys.length) return defaultValue;
+        if (time <= keys[0][0]) return keys[0].slice(1);
+        var left = 0;
+        var right = keys.length - 1;
+        if (time >= keys[right][0]) return keys[right].slice(1);
+        while (right - left > 1) {
+            var middle = Math.floor((left + right) / 2);
+            if (keys[middle][0] <= time) left = middle;
+            else right = middle;
+        }
+        var from = keys[left];
+        var to = keys[right];
+        var fraction = (time - from[0]) / (to[0] - from[0]);
+        var values = [];
+        for (var i = 1; i < from.length; i++) {
+            values.push(from[i] + fraction * (to[i] - from[i]));
+        }
+        return values;
+    }
+
+    function applyTransform(layer, c, d, footage, notices) {
         var t = c.transform;
         if (!t) return;
         // Match names must be resolved from their immediate parent group.
         var group = layer.property("ADBE Transform Group");
         if (!group) throw new Error("Transformグループを取得できません");
-        function setTransform(matchName, value) {
+        var animation = c.transform_keys || {};
+        var duration = c.duration / d.fps;
+        var offset = c.offset / d.fps;
+
+        function setTransform(matchName, curves, sample) {
             var prop = group.property(matchName);
             if (!prop) throw new Error("Transformプロパティを取得できません: " + matchName);
-            try { prop.setValue(value); }
-            catch (e) { throw new Error("Transform適用失敗 (" + matchName + "): " + e.toString()); }
+            var times = [];
+            for (var i = 0; i < curves.length; i++) {
+                var keys = curves[i];
+                if (!keys) continue;
+                for (var j = 0; j < keys.length; j++) {
+                    // トリム外のキーは、表示範囲の端で内挿して引き継ぐ。
+                    times.push(Math.max(0, Math.min(duration, keys[j][0])));
+                }
+            }
+            if (!times.length) {
+                prop.setValue(sample(0));
+                return;
+            }
+
+            times.sort(function (a, b) { return a - b; });
+            try {
+                for (var k = 0; k < times.length; k++) {
+                    if (k === 0 || times[k] - times[k - 1] > 1e-7) {
+                        prop.setValueAtTime(offset + times[k], sample(times[k]));
+                    }
+                }
+            } catch (e) {
+                // 変形キーだけを戻して静的な変形でレイヤーを残す。
+                for (var j = prop.numKeys; j >= 1; j--) prop.removeKey(j);
+                prop.setValue(sample(0));
+                notices.push(c.name + ": キーフレーム適用失敗 (" + matchName + "): " + e.toString());
+                return;
+            }
+            try {
+                for (var key = 1; key <= prop.numKeys; key++) {
+                    prop.setInterpolationTypeAtKey(key, KeyframeInterpolationType.LINEAR, KeyframeInterpolationType.LINEAR);
+                    if (prop.isSpatial) {
+                        prop.setSpatialAutoBezierAtKey(key, false);
+                        prop.setSpatialContinuousAtKey(key, false);
+                        var zeroTangent = prop.keyInSpatialTangent(key);
+                        for (var axis = 0; axis < zeroTangent.length; axis++) zeroTangent[axis] = 0;
+                        prop.setSpatialTangentsAtKey(key, zeroTangent, zeroTangent);
+                    }
+                }
+            } catch (e) {
+                notices.push(c.name + ": キーフレームの補間設定失敗 (" + matchName + "): " + e.toString());
+            }
         }
 
         var compW = d.width || 1920;
         var compH = d.height || 1080;
         var srcW = c.src_w || footage.width;
         var srcH = c.src_h || footage.height;
-
         var fit = getFitFactor(d.input_scaling, srcW, srcH, compW, compH);
+        var signX = (t.flip_x === true || t.flip_x === 1) ? -1 : 1;
+        var signY = (t.flip_y === true || t.flip_y === 1) ? -1 : 1;
 
-        var sx = fit.x * (t.zoom_x != null ? t.zoom_x : 1) * 100;
-        var sy = fit.y * (t.zoom_y != null ? t.zoom_y : 1) * 100;
-        if (t.flip_x === true || t.flip_x === 1) sx = -sx;
-        if (t.flip_y === true || t.flip_y === 1) sy = -sy;
+        setTransform("ADBE Scale", [animation.scale], function (time) {
+            var zoom = sampleKeys(animation.scale, time, [t.zoom_x == null ? 1 : t.zoom_x, t.zoom_y == null ? 1 : t.zoom_y]);
+            return [fit.x * zoom[0] * 100 * signX, fit.y * zoom[1] * 100 * signY];
+        });
 
-        setTransform("ADBE Scale", [sx, sy]);
-
-        // Resolveはアンカーを「ピボット」として扱う。変換モデルは
-        //   画面位置 = (素材座標 - ピボット) * 実効拡大率 + コンプ中心 + Pan + アンカー値
-        // よってAEでは アンカー と ポジション の両方を動かす必要がある。
-        //   ピボット(素材px) = 素材中心 + アンカー値 / フィット係数
-        //   ポジション       = コンプ中心 + Pan + アンカー値
-        var ax = t.anchor_x || 0;
-        var ay = t.anchor_y || 0;
-
-        setTransform("ADBE Anchor Point", [
-            srcW / 2 + (fit.x !== 0 ? ax / fit.x : 0),
-            srcH / 2 - (fit.y !== 0 ? ay / fit.y : 0)  // ResolveのYは上が正
-        ]);
-
-        setTransform("ADBE Position", [
-            compW / 2 + (t.pan || 0) + ax,
-            compH / 2 - (t.tilt || 0) - ay
-        ]);
-
-        setTransform("ADBE Rotate Z", t.rotation || 0);
-
-        if (t.opacity != null && t.opacity !== 100) {
-            setTransform("ADBE Opacity", t.opacity);
+        // Resolveのアンカーはピボット。AEではアンカーと表示位置の両方へ反映する。
+        var baseAnchor = [t.anchor_x || 0, t.anchor_y || 0];
+        var basePosition = [t.pan || 0, t.tilt || 0];
+        setTransform("ADBE Anchor Point", [animation.anchor], function (time) {
+            var anchor = sampleKeys(animation.anchor, time, baseAnchor);
+            return [srcW / 2 + (fit.x !== 0 ? anchor[0] / fit.x : 0),
+                    srcH / 2 - (fit.y !== 0 ? anchor[1] / fit.y : 0)];
+        });
+        setTransform("ADBE Position", [animation.position, animation.anchor], function (time) {
+            var position = sampleKeys(animation.position, time, basePosition);
+            var anchor = sampleKeys(animation.anchor, time, baseAnchor);
+            return [compW / 2 + position[0] + anchor[0], compH / 2 - position[1] - anchor[1]];
+        });
+        setTransform("ADBE Rotate Z", [animation.rotation], function (time) {
+            return sampleKeys(animation.rotation, time, [t.rotation || 0])[0];
+        });
+        if (animation.amount || (t.opacity != null && t.opacity !== 100)) {
+            setTransform("ADBE Opacity", [animation.amount], function (time) {
+                return sampleKeys(animation.amount, time, [t.opacity == null ? 100 : t.opacity])[0];
+            });
         }
     }
 
@@ -330,7 +393,9 @@
             else if (d.display_start_time != null) comp.displayStartTime = d.display_start_time;
         } catch (eTC) { notices.push("開始タイムコード設定失敗: " + eTC.toString()); }
         comp.comment = "R2AE / Resolve fps=" + (d.fps_raw || fps)
-            + " / interlaced=" + d.interlaced + " / 元のINフレーム=" + d.display_start_frame;
+            + " / interlaced=" + d.interlaced
+            + (d.display_start_frame != null ? " / Resolve開始フレーム=" + d.display_start_frame
+                 : " / Resolve開始秒=" + d.display_start_time);
 
         // JSONは下のレイヤーから順に並んでいる（audio -> V1 -> V2...）
         // layers.add() は常に最前面に追加されるため、この順で追加すれば
@@ -406,7 +471,7 @@
                     retimed.push(c.name + " -> " + status);
                 }
 
-                applyTransform(layer, c, d, footage);
+                applyTransform(layer, c, d, footage, notices);
 
                 // Aトラック側を独立レイヤーにした場合、映像側の音声はオフにする
                 if (c.mute_audio === true && layer.hasAudio) {

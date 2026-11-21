@@ -1,6 +1,6 @@
 # R2AE
 
-> Review revision, 2026-09-14. Thirty-four Lua/AE mock-host regression tests pass (including a fix for the Transform property hierarchy regression); this revision has not been tested end to end in Resolve and After Effects. Update both scripts together. See [REVIEW.ja.md](REVIEW.ja.md) for findings and the integration test matrix.
+> Update both scripts together. See [REVIEW.ja.md](REVIEW.ja.md) for earlier fixes and verification results.
 
 **[日本語 README](README.ja.md)**
 
@@ -14,25 +14,26 @@ This is not a persistent link like Adobe Dynamic Link. Each time you run it, the
 
 ## What it does
 
-- Sends all clips overlapping the timeline's IN/OUT range in one go (clips crossing the range boundary are trimmed at the edge)
+- Sends selected clips from the Edit page timeline, including standalone audio such as WAV clips
 - Supports multiple tracks (video and audio). Respects track-level and clip-level enable/disable
-- Transfers current timeline resolution, fps, DF/NDF display and the IN mark as composition start timecode
+- Transfers the current timeline's resolution, fps, DF/NDF display, input sizing and the start timecode of the transferred span
 - Converts each clip's Zoom, Pan/Tilt, Rotation, Anchor Point, Flip, and Opacity into AE's Scale / Position / Rotation / Anchor Point / Opacity
+- On macOS, rebuilds exported position, zoom, rotation, anchor point, and opacity keys as editable After Effects keyframes
 - Reproduces constant-speed retiming via AE's Time Remap, with a check to avoid misreading frame-rate conforms as speed changes
-- Keeps A tracks as independent audio layers; optional deduplication does not verify channel mapping
+- Merges matching audio into video layers and keeps other audio on separate layers. Channel mapping is unsupported.
 - Prevents double playback of audio linked to a video clip
 - Reuses matching footage within a transfer; subsequent transfers import fresh footage to isolate interpretation settings
 
 ## What it doesn't do
 
 - Real-time sync (this is not a persistent link like Dynamic Link)
-- Transitions, keyframed animation, speed ramps (variable speed)
+- Transitions, speed ramps (variable speed), and keyframes for Fusion or effects
 - Color grading, Resolve-side effects, cropping, compound clips, Fusion clips, titles
 - Pitch / Yaw (3D tilt) — not supported due to differences in projection models between the two applications
 
 ## Requirements
 
-- DaVinci Resolve (free or Studio; Lua scripting must be enabled)
+- DaVinci Resolve 21.0.4 or later with in-app Lua scripting
 - Adobe After Effects (2024 or later recommended)
 - macOS or Windows
 
@@ -75,16 +76,14 @@ A diagnostic script for inspecting the raw values Resolve returns. Place it in t
 
 ## Usage
 
-**On Windows, open After Effects first.** If it isn't already running, R2AE can't launch it automatically (details below).
+On Windows, open After Effects first.
 
-1. In the Resolve timeline, mark the range you want to send using `I` / `O` (In/Out points)
-2. Run Workspace > Scripts > Utility > `r2ae`
+1. In the Resolve Edit page, select the video and audio clips you want to send from the timeline.
+2. Run Workspace > Scripts > Utility > `r2ae` to create a new composition in After Effects.
 
-**macOS**: After Effects launches (or comes to the foreground) and a new composition is built automatically.
+The composition starts at the earliest transferred clip's timecode and preserves edits, gaps, and track order. Select the audio clips you want to include. An empty selection produces no composition.
 
-**Windows**: After the JSON is written, R2AE detects the running After Effects process and sends the script to it directly via `AfterFX.exe -r`. **After Effects needs to be open first** — if it isn't, the Console says so and the JSON stays written for later. If direct execution doesn't work in your environment, open `r2ae_receive.jsx` manually via File > Scripts > Run Script File.
-
-All clips on any track that overlap the IN/OUT range are included. Clips crossing the range boundary are trimmed at the edge, and the composition's duration matches the marked range exactly. If no IN/OUT range is set, nothing is sent.
+If Windows automation fails, open `r2ae_receive.jsx` via File > Scripts > Run Script File in After Effects to import the exported JSON.
 
 ## Configuration
 
@@ -92,10 +91,11 @@ Behavior can be changed via variables at the top of `r2ae.lua`.
 
 | Variable | Description |
 |---|---|
-| `AUDIO_MODE` | `"auto"` (default; merges matching A/V items) / `"separate"` (independent audio layers) / `"video_only"` (uses embedded video audio) |
-| `INPUT_SCALING` | `"fit"` (default) / `"fill"` / `"stretch"` / `"none"` — should match Resolve's project setting for "Input Sizing Preset" |
+| `AUDIO_MODE` | `"auto"` (default; merges matching A/V items) / `"separate"` (independent audio layers) |
+| `INPUT_SCALING` | `"auto"` (default; uses the timeline's input sizing setting) / `"fit"` / `"fill"` / `"stretch"` / `"none"` |
 | `ROTATION_SIGN` | `1` / `-1` (default) — corrects rotation direction |
 | `ENABLE_SPEED` | `true` (default) — whether speed changes are reflected as Time Remap |
+| `ENABLE_TRANSFORM_KEYFRAMES` | `true` (default) — transfer Edit page transform keys on macOS |
 | `RESPECT_TRACK_ENABLE` | `true` (default) — exclude disabled tracks |
 | `RESPECT_CLIP_ENABLE` | `true` (default) — exclude disabled clips (the `D` key state) |
 
@@ -112,17 +112,18 @@ After that, there is no remaining connection between the two applications.
 
 Resolve's inspector values (Zoom / Pan / Tilt / Anchor Point / Rotation) live in a coordinate system shaped by the timeline resolution, the source resolution, and the project's input scaling setting. In particular, Anchor Point in Resolve behaves as a pivot rather than a simple offset — moving it also moves the clip's on-screen position. This tool derives the conversion formulas from measured, real-world values (see the comments in `r2ae.lua` for details).
 
+On macOS, R2AE extracts keys for the selected clips from a temporary Resolve FCPXML export. AE uses linear interpolation, including when calculating a value at a trim boundary. Clips with a time map and overlapping instances of the same media with identical placement and duration transfer with static transforms.
+
 ## Timing and interpretation in this revision
 
 Movies keep the fps interpreted by AE's importer; image sequences use their Resolve source fps. A different Resolve clip interpretation rate is represented by layer retiming. DF is timecode numbering, not frame removal. Composition DF is explicitly set; source DF and Resolve-only source timecode overrides are not guaranteed. Source timecode and FPS metadata are recorded in comments.
 
-Recognized source Field Dominance values set AE field separation. Unknown values retain importer interpretation and produce a notice. Field rendering is an output setting and must be configured separately. The verified setting key is `timelineInterlaceProcessing`. Interlaced API rates >= 49 use field ticks: composition fps and timeline coordinates are divided by two together, preserving elapsed seconds; source trimming still uses the original API clock. Progressive 59.94 fps remains unchanged. The Resolve API values were read live; the updated AE composition has not yet been verified live. `MARK_COORDINATES` defaults to `"relative"`; use `"absolute"` only if verified for the Resolve version.
+Recognized source Field Dominance values set AE field separation. Unknown values retain importer interpretation and produce a notice. Field rendering is an output setting and must be configured separately. The verified setting key is `timelineInterlaceProcessing`. Interlaced API rates >= 49 use field ticks: composition fps and timeline coordinates are divided by two together, preserving elapsed seconds; source trimming still uses the original API clock. Progressive 59.94 fps remains unchanged. The Resolve API values were read live; the updated interlaced composition has not yet been verified live in AE.
 
 In auto mode, matching source, timing, trim and speed allow one A item to enable embedded audio on one video layer. Unmatched audio stays separate; video without a matching A item stays muted. `DEDUPE_AUDIO` defaults to false. Channel mapping, volume, pan, Fairlight processing, pitch preservation and sample-accurate audio trims are unsupported. Retime estimation, field interpretation, non-square-pixel transforms, freezes, VFR and Optical Flow still require real application verification. See the Japanese review for the test matrix.
 
 ## Known limitations
 
-- The Resolve Scripting API has no way to query which clips are currently selected on the timeline. Because of this, range selection is done via IN/OUT marks. If you need to send only specific clips, combine this with track/clip enable-disable
 - The check that distinguishes a frame-rate conform from an actual speed change is heuristic. If you notice a misclassification, please file an issue with the measured values (from the Resolve Console log)
 - Pitch / Yaw are not supported, since Resolve and After Effects use different projection models and cannot be reconciled accurately
 - Windows automatic execution requires After Effects to already be running. If it isn't, R2AE doesn't launch it automatically — the Console will say so, and the JSON stays written so you can pick it up later (open After Effects, then run the script manually)

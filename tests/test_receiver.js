@@ -18,13 +18,18 @@ function run(data, options={}) {
     function FootageItem(){this.mainSource=new FileSource();this.frameRate=options.nativeFps||60000/1001;
         this.hasVideo=options.hasVideo!==false;this.duration=options.sourceDuration||100;this.width=1920;this.height=1080;}
     const existing=new FootageItem(); existing.mainSource.file=new File('/movie.mov'); existing.frameRate=12;
-    function property(){
+    function property(isSpatial=false){
         const keys=[];
-        return {value:null, keys,
+        return {value:null, keys, isSpatial,
             setValue(v){this.value=v;},
             setValueAtTime(t,v){const k=keys.find(x=>Math.abs(x.t-t)<1e-10);if(k)k.v=v;else keys.push({t,v});keys.sort((a,b)=>a.t-b.t);},
             get numKeys(){return keys.length;},keyTime(k){return keys[k-1].t;},
-            removeKey(k){keys.splice(k-1,1);},setInterpolationTypeAtKey(){}};
+            removeKey(k){keys.splice(k-1,1);},setInterpolationTypeAtKey(){},
+            setSpatialAutoBezierAtKey(){},setSpatialContinuousAtKey(){},keyInSpatialTangent(){return [1,2,3];},
+            setSpatialTangentsAtKey(k,inTangent,outTangent){
+                if(inTangent.length!==3 || outTangent.length!==3) throw new Error('AE requires a three-component tangent');
+                keys[k-1].tangent=Array.from(inTangent);
+            }};
     }
     const app={beginUndoGroup(){state.undo++;},endUndoGroup(){state.undo--;},
         project:{numItems:1,item(){return existing;},items:{
@@ -36,7 +41,8 @@ function run(data, options={}) {
                     const transform={property(name){
                         const valid=['ADBE Scale','ADBE Position','ADBE Anchor Point','ADBE Rotate Z','ADBE Opacity'];
                         if(!valid.includes(name) || options.missingTransformProperty===name)return null;
-                        return transformProps[name]||(transformProps[name]=property());
+                        const spatial=name==='ADBE Position'||name==='ADBE Anchor Point';
+                        return transformProps[name]||(transformProps[name]=property(spatial));
                     }};
                     const layer={footage,hasAudio:true,enabled:true,audioEnabled:true,stretch:100,
                         property(name){
@@ -133,6 +139,22 @@ test('missing Transform property is reported instead of silently ignoring all tr
     const s=run(fixture(),{missingTransformProperty:'ADBE Scale'});
     assert.ok(s.alerts.some(x=>x.includes('ADBE Scale')));
     assert.equal(s.comps[0].list[0].removed,true);
+});
+test('animation preserves layer offset, trim boundaries, independent axes and anchor compensation',()=>{
+    const d=fixture({fps:24,duration:48});
+    Object.assign(d.clips[0],{offset:24,duration:24,source_in:0,src_fps:24,
+        transform:{flip_x:true}, transform_keys:{
+            position:[[-.5,0,0],[.5,100,20]], anchor:[[.75,50,-10]],
+            scale:[[0,1,1],[1,1.5,1.25]], rotation:[[.25,-20],[.75,0]], amount:[[.5,75],[1.5,0]]
+        }});
+    const t=run(d,{nativeFps:24}).comps[0].list[0].property('ADBE Transform Group');
+    const keys=name=>t.property(name).keys.map(({t,v})=>[t,Array.isArray(v)?Array.from(v):v]);
+    assert.deepEqual(keys('ADBE Position'),[[1,[1060,540]],[1.5,[1110,530]],[1.75,[1110,530]]]);
+    assert.deepEqual(keys('ADBE Anchor Point'),[[1.75,[1010,550]]]);
+    assert.deepEqual(keys('ADBE Scale'),[[1,[-100,100]],[2,[-150,125]]]);
+    assert.deepEqual(keys('ADBE Rotate Z'),[[1.25,-20],[1.75,0]]);
+    assert.deepEqual(keys('ADBE Opacity'),[[1.5,75],[2,37.5]]);
+    assert.deepEqual(t.property('ADBE Position').keys[0].tangent,[0,0,0]);
 });
 test('Windows sequence and spaced Unicode path retain source fps and Transform',()=>{
     const d=fixture();Object.assign(d.clips[0],{path:'C:\\Users\\Editor Name\\素材\\shot_0001.exr',

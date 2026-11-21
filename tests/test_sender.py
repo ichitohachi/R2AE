@@ -1,5 +1,8 @@
 """Run with Python + lupa; mocks Resolve and IO, never launches either app."""
 import json
+import shutil
+import subprocess
+import tempfile
 import unittest
 from pathlib import Path
 from lupa import LuaRuntime
@@ -7,18 +10,30 @@ from lupa import LuaRuntime
 SOURCE = (Path(__file__).resolve().parents[1] / 'r2ae.lua').read_text()
 
 class SenderTests(unittest.TestCase):
-    def run_sender(self, fps='29.97 DF', start=107892, marks=(120000,120029),
+    def run_sender(self, fps='29.97 DF', start=107892, span=(120000,120050),
                    srcfps='59.94', interlace='0', reverse=False, audio=True,
-                   overrides='', source=SOURCE, drop=None):
+                   overrides='', source=SOURCE, drop=None, selection=None, fcpxml=None):
         lua = LuaRuntime(unpack_returned_tuples=True)
         lua.globals().FPS = fps
         lua.globals().START = start
-        lua.globals().IN, lua.globals().OUT = marks
+        lua.globals().FIRST, lua.globals().LAST = span
         lua.globals().SRCFPS = srcfps
         lua.globals().INTERLACE = interlace
         lua.globals().DROP = drop
         lua.globals().REVERSE = reverse
         lua.globals().AUDIO = audio
+        lua.globals().SELECTION = selection
+        if fcpxml is not None:
+            xsltproc = shutil.which('xsltproc')
+            if not xsltproc:
+                self.skipTest('macOS FCPXML extraction uses xsltproc')
+            def extract_rows(stylesheet):
+                with tempfile.TemporaryDirectory() as directory:
+                    style_path = Path(directory) / 'test.xsl'
+                    style_path.write_text(stylesheet)
+                    return subprocess.check_output([xsltproc, '--nonet', str(style_path), '-'],
+                                                   input=fcpxml, text=True)
+            lua.globals().extract_rows = extract_rows
         lua.execute('''
         output, logs = nil, {}
         print = function(...) logs[#logs+1] = table.concat({...}, " ") end
@@ -32,15 +47,13 @@ class SenderTests(unittest.TestCase):
         -- Directory creation is stubbed separately; app launch must never run.
         local ts = {timelineFrameRate=FPS,timelineResolutionWidth="3840",
             timelineResolutionHeight="2160",timelineInterlaceProcessing=INTERLACE,
-            timelinePixelAspectRatio="Square",timelineDropFrameTimecode=DROP}
+            timelinePixelAspectRatio="Square",timelineDropFrameTimecode=DROP,
+            timelineInputResMismatchBehavior="scaleToCrop"}
         local props = {["File Path"]="/mock/test.mov",["FPS"]=SRCFPS,
             ["Frames"]="1000",["Resolution"]="1920x1080",
             ["Start TC"]="01:00:00;00",["Field Dominance"]="Upper Field First"}
         local mpi = {GetClipProperty=function() return props end}
-        local item = {
-            GetStart=function() return START+IN-10 end,
-            GetEnd=function() return START+OUT+11 end,
-            GetDuration=function() return OUT-IN+21 end,
+        local base = {
             GetLeftOffset=function() return 100 end,
             GetRightOffset=function() return 800 end,
             GetSourceStartFrame=function() return REVERSE and 199 or 100 end,
@@ -50,21 +63,72 @@ class SenderTests(unittest.TestCase):
             GetName=function() return '日本語 "clip"\\nline\\t' end,
             GetProperty=function() return {FlipX=false,FlipY=false} end
         }
+        local function clip(kind, track, first, last, opts)
+            opts = opts or {}
+            return setmetatable({
+                GetName=opts.name and function() return opts.name end or nil,
+                GetStart=function() return START + first end,
+                GetEnd=function() return START + last end,
+                GetDuration=function() return last - first end,
+                GetTrackTypeAndIndex=function() return {kind, track} end,
+                GetClipEnabled=function() return opts.enabled ~= false end,
+                GetMediaPoolItem=opts.path and function()
+                    return {GetClipProperty=function() return {["File Path"]=opts.path} end}
+                end or nil,
+            }, {__index=base})
+        end
+        local selected = {clip('video', 1, FIRST, LAST)}
+        if AUDIO then table.insert(selected, clip('audio', 1, FIRST, LAST)) end
+        local selections = {
+            multi={clip('video', 2, 40, 50, {name='video 2'}),
+                   clip('audio', 1, 10, 30, {name='audio 1'}),
+                   clip('video', 1, 10, 30, {name='video 1'}),
+                   clip('audio', 2, 35, 40, {name='audio 2'}),
+                   clip('video', 1, 0, 100, {enabled=false}),
+                   clip('video', 3, 0, 100)},
+            audio={clip('audio', 1, 10, 30, {path='/mock/standalone.wav'})},
+            empty={},
+        }
         local timeline = {
             GetSetting=function() return ts end,
             GetStartTimecode=function() return "01:00:00:00" end,
             GetStartFrame=function() return START end,
-            GetMarkInOut=function() return {video={['in']=IN,out=OUT},audio={['in']=IN,out=OUT}} end,
-            GetTrackCount=function(self, kind) return kind=="video" and 1 or (AUDIO and 1 or 0) end,
-            GetItemListInTrack=function() return {item} end,
-            GetIsTrackEnabled=function() return true end,
-            GetName=function() return "timeline" end
+            GetMarkInOut=function() error('unexpected IN/OUT lookup') end,
+            GetItemListInTrack=function() error('unexpected track scan') end,
+            GetTrackCount=function() return 3 end,
+            GetIsTrackEnabled=function(self, kind, index) return index < 3 end,
+            GetName=function() return "timeline" end,
         }
+        if SELECTION ~= 'unavailable' then
+            timeline.GetSelectedClips=function()
+                local items = SELECTION and selections[SELECTION] or selected
+                items.n = #items -- Resolve's Lua list also carries metadata.
+                return items
+            end
+        end
         local project = {
-            GetSetting=function() return {timelineFrameRate="24",timelineResolutionWidth="1920",timelineResolutionHeight="1080"} end,
+            GetSetting=function() return {timelineFrameRate="24",timelineResolutionWidth="1920",
+                timelineResolutionHeight="1080",timelineInputResMismatchBehavior="scaleToFit"} end,
             GetCurrentTimeline=function() return timeline end
         }
         resolve = {GetProjectManager=function() return {GetCurrentProject=function() return project end} end}
+        if extract_rows then
+            resolve.EXPORT_FCPXML_1_9 = 1
+            timeline.Export = function() return true end
+            local style
+            local open = io.open
+            os.tmpname = function() return '/mock/FCPXML-test' end
+            os.remove = function() end
+            io.open = function(path, mode)
+                if path ~= '/mock/FCPXML-test' then return open(path, mode) end
+                return {write=function(self, text) style=text; return self end,
+                        close=function() return true end}
+            end
+            io.popen = function()
+                return {read=function() return extract_rows(style) end,
+                        close=function() return true end}
+            end
+        end
         ''')
         modified = source.replace('ensure_dir(BRIDGE_DIR)', '-- test: no directory creation')
         if overrides:
@@ -73,14 +137,66 @@ class SenderTests(unittest.TestCase):
         lua.execute(modified)
         return json.loads(lua.globals().output) if lua.globals().output else None
 
-    def test_df_timeline_and_long_relative_marks(self):
+    def test_selection_preserves_gaps_track_order_and_source_trim(self):
+        d = self.run_sender(selection='multi')
+        self.assertEqual(d['display_start_frame'], 107902)
+        self.assertEqual(d['duration'], 40)
+        self.assertEqual([(c['name'], c['offset'], c['duration']) for c in d['clips']],
+                         [('audio 2', 25, 5), ('video 1', 0, 20), ('video 2', 30, 10)])
+        self.assertEqual(d['clips'][1]['source_in'], 100)
+        self.assertFalse(d['clips'][1]['mute_audio'])
+        self.assertTrue(d['clips'][2]['mute_audio'])
+
+    def test_selection_audio_only(self):
+        d = self.run_sender(selection='audio')
+        self.assertEqual([c['kind'] for c in d['clips']], ['audio'])
+        self.assertEqual(d['duration'], 20)
+        self.assertEqual(d['clips'][0]['path'], '/mock/standalone.wav')
+
+    def test_fcpxml_keys_follow_the_selected_nested_clip_and_its_source_trim(self):
+        xml = '''<fcpxml><resources><asset id="r1" hasVideo="1">
+          <media-rep kind="original-media" src="file:///mock/test%2Emov"/>
+        </asset></resources><library><event><project><sequence tcStart="3600s"><spine>
+          <asset-clip ref="r1" start="1s" offset="3601s" duration="2s">
+            <asset-clip ref="r1" lane="1" start="2s" offset="3/2s" duration="1s">
+              <adjust-transform><param name="position"><keyframeAnimation>
+                <keyframe time="3/2s" value="0 0"/><keyframe time="5/2s" value="5 2.5"/>
+              </keyframeAnimation></param><param name="rotation"><keyframeAnimation>
+                <keyframe time="5/2s" value="10"/>
+              </keyframeAnimation></param></adjust-transform>
+              <adjust-blend><param name="amount"><keyframeAnimation>
+                <keyframe time="2s" value="0.75"/>
+              </keyframeAnimation></param></adjust-blend>
+            </asset-clip>
+            <asset-clip ref="r1" lane="-1" srcEnable="audio" start="2s" offset="3/2s" duration="1s"/>
+          </asset-clip>
+        </spine></sequence></project></event></library></fcpxml>'''
+        d = self.run_sender(fps='24', start=86400, span=(36,60), audio=False, fcpxml=xml)
+        self.assertEqual(len(d['clips']), 1)
+        self.assertEqual(d['clips'][0]['transform_keys'], {
+            'position': [[-.5, 0, 0], [.5, 108, 54]],
+            'rotation': [[.5, -10]], 'amount': [[0, 75]],
+        })
+        duplicate = xml.replace('lane="-1" srcEnable="audio"', 'lane="2"')
+        d = self.run_sender(fps='24', start=86400, span=(36,60), audio=False, fcpxml=duplicate)
+        self.assertNotIn('transform_keys', d['clips'][0])
+        self.assertTrue(any('重なっている' in message for message in d['warnings']))
+
+    def test_empty_or_unavailable_selection_never_exports_in_out(self):
+        for selection in ('empty', 'unavailable'):
+            with self.subTest(selection=selection):
+                self.assertIsNone(self.run_sender(selection=selection))
+
+    def test_df_timeline_and_late_clip_start(self):
         d=self.run_sender()
         self.assertAlmostEqual(d['fps'],30000/1001)
         self.assertTrue(d['drop_frame'])
         self.assertEqual((d['width'],d['height']),(3840,2160))
+        self.assertEqual(d['pixel_aspect'],1)
+        self.assertEqual(d['input_scaling'],'fill')
         self.assertEqual(d['display_start_frame'],227892)
-        self.assertEqual(d['duration'],30)
-        self.assertEqual(d['clips'][-1]['source_in'],120)
+        self.assertEqual(d['duration'],50)
+        self.assertEqual(d['clips'][-1]['source_in'],100)
         self.assertEqual(d['clips'][-1]['speed'],1)
         self.assertEqual(len(d['clips']),1)
         self.assertEqual(d['clips'][0]['kind'],'video')
@@ -128,7 +244,7 @@ class SenderTests(unittest.TestCase):
     def test_reverse_at_100_percent_keeps_sign(self):
         d=self.run_sender(reverse=True)
         self.assertEqual(d['clips'][-1]['speed'],-1)
-        self.assertEqual(d['clips'][-1]['source_in'],179)
+        self.assertEqual(d['clips'][-1]['source_in'],199)
 
     def test_no_audio_does_not_restore_embedded_sound(self):
         d=self.run_sender(audio=False)
@@ -139,7 +255,7 @@ class SenderTests(unittest.TestCase):
         self.assertFalse(d['drop_frame'])
 
     def test_interlace_converts_field_ticks_without_changing_seconds(self):
-        d=self.run_sender(fps='59.94',interlace='1',start=215784,marks=(0,157),audio=False,drop='1')
+        d=self.run_sender(fps='59.94',interlace='1',start=215784,span=(0,158),audio=False,drop='1')
         self.assertAlmostEqual(d['fps'],30000/1001)
         self.assertEqual(d['duration'],79)
         self.assertEqual(d['display_start_frame'],107892)
@@ -149,24 +265,17 @@ class SenderTests(unittest.TestCase):
         self.assertTrue(d['drop_frame'])
 
     def test_progressive_5994_is_not_halved(self):
-        d=self.run_sender(fps='59.94 DF',interlace='0',marks=(0,157))
+        d=self.run_sender(fps='59.94 DF',interlace='0',span=(0,158))
         self.assertAlmostEqual(d['fps'],60000/1001)
         self.assertEqual(d['duration'],158)
         self.assertTrue(d['drop_frame'])
 
-    def test_interlace_pal_and_half_frame_marks(self):
-        d=self.run_sender(fps='50',interlace='1',start=180000,marks=(1,50))
+    def test_interlace_pal_and_half_frame_clip_start(self):
+        d=self.run_sender(fps='50',interlace='1',start=180000,span=(1,51))
         self.assertEqual(d['fps'],25)
         self.assertEqual(d['duration'],25)
         self.assertIsNone(d['display_start_frame'])
         self.assertAlmostEqual(d['display_start_time'],180001/50)
-
-    def test_audio_only_marks_fallback(self):
-        source=SOURCE.replace('local v, au = mio.video, mio.audio','local v, au = {}, mio.audio')
-        self.assertEqual(self.run_sender(source=source)['duration'],30)
-
-    def test_partial_marks_rejected(self):
-        self.assertIsNone(self.run_sender(marks=(-1,29)))
 
     def test_invalid_fps_does_not_silently_use_24(self):
         for raw in ['bogus', '0', '30000/0', '29.97 nonsense']:
