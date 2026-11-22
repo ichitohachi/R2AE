@@ -140,20 +140,24 @@ test('missing Transform property is reported instead of silently ignoring all tr
     assert.ok(s.alerts.some(x=>x.includes('ADBE Scale')));
     assert.equal(s.comps[0].list[0].removed,true);
 });
-test('animation preserves layer offset, trim boundaries, independent axes and anchor compensation',()=>{
+test('animation preserves original keys outside layer trim and comp bounds',()=>{
     const d=fixture({fps:24,duration:48});
     Object.assign(d.clips[0],{offset:24,duration:24,source_in:0,src_fps:24,
         transform:{flip_x:true}, transform_keys:{
-            position:[[-.5,0,0],[.5,100,20]], anchor:[[.75,50,-10]],
+            position:[[-1.5,0,0],[.5,100,20]], anchor:[[.75,50,-10]],
             scale:[[0,1,1],[1,1.5,1.25]], rotation:[[.25,-20],[.75,0]], amount:[[.5,75],[1.5,0]]
         }});
-    const t=run(d,{nativeFps:24}).comps[0].list[0].property('ADBE Transform Group');
+    const c=run(d,{nativeFps:24}).comps[0], l=c.list[0];
+    const t=l.property('ADBE Transform Group');
     const keys=name=>t.property(name).keys.map(({t,v})=>[t,Array.isArray(v)?Array.from(v):v]);
-    assert.deepEqual(keys('ADBE Position'),[[1,[1060,540]],[1.5,[1110,530]],[1.75,[1110,530]]]);
+    assert.deepEqual(keys('ADBE Position'),[[-.5,[1010,550]],[1.5,[1110,530]],[1.75,[1110,530]]]);
     assert.deepEqual(keys('ADBE Anchor Point'),[[1.75,[1010,550]]]);
     assert.deepEqual(keys('ADBE Scale'),[[1,[-100,100]],[2,[-150,125]]]);
     assert.deepEqual(keys('ADBE Rotate Z'),[[1.25,-20],[1.75,0]]);
-    assert.deepEqual(keys('ADBE Opacity'),[[1.5,75],[2,37.5]]);
+    assert.deepEqual(keys('ADBE Opacity'),[[1.5,75],[2.5,0]]);
+    assert.equal(l.inPoint,1);
+    assert.equal(l.outPoint,2);
+    assert.equal(c.duration,2);
     assert.deepEqual(t.property('ADBE Position').keys[0].tangent,[0,0,0]);
 });
 test('Windows sequence and spaced Unicode path retain source fps and Transform',()=>{

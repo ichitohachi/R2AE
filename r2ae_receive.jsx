@@ -166,7 +166,6 @@
         var group = layer.property("ADBE Transform Group");
         if (!group) throw new Error("Transformグループを取得できません");
         var animation = c.transform_keys || {};
-        var duration = c.duration / d.fps;
         var offset = c.offset / d.fps;
 
         function setTransform(matchName, curves, sample) {
@@ -177,8 +176,8 @@
                 var keys = curves[i];
                 if (!keys) continue;
                 for (var j = 0; j < keys.length; j++) {
-                    // トリム外のキーは、表示範囲の端で内挿して引き継ぐ。
-                    times.push(Math.max(0, Math.min(duration, keys[j][0])));
+                    // 表示範囲はレイヤーのIN/OUTで制御し、キーの元時刻を保つ。
+                    times.push(keys[j][0]);
                 }
             }
             if (!times.length) {

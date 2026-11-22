@@ -112,7 +112,7 @@ After that, there is no remaining connection between the two applications.
 
 Resolve's inspector values (Zoom / Pan / Tilt / Anchor Point / Rotation) live in a coordinate system shaped by the timeline resolution, the source resolution, and the project's input scaling setting. In particular, Anchor Point in Resolve behaves as a pivot rather than a simple offset — moving it also moves the clip's on-screen position. This tool derives the conversion formulas from measured, real-world values (see the comments in `r2ae.lua` for details).
 
-On macOS, R2AE extracts keys for the selected clips from a temporary Resolve FCPXML export. AE uses linear interpolation, including when calculating a value at a trim boundary. Clips with a time map and overlapping instances of the same media with identical placement and duration transfer with static transforms.
+On macOS, R2AE extracts keys for the selected clips from a temporary Resolve FCPXML export. AE uses linear interpolation and preserves the exported key times, including keys outside the layer's visible in/out points. Clips with a time map and overlapping instances of the same media with identical placement and duration transfer with static transforms.
 
 ## Timing and interpretation in this revision
 
