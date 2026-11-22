@@ -85,6 +85,18 @@ Windowsでは、先にAfter Effectsを起動してください。
 
 Windowsで自動実行に失敗した場合は、AEのファイル > スクリプト > スクリプトファイルを実行から `r2ae_receive.jsx` を開くと、書き出し済みのJSONを取り込めます。
 
+### ACES 2.0のIDTを引き継ぐ
+
+リポジトリの `color` フォルダを、インストール先の `r2ae_receive.jsx` と同じ階層にコピーします。AE 26.5以降で、標準の **ACES 2.0 Studio v4.0** と Working Color Space の **ACES/ACEScg** を使用します。
+
+macOSでResolveのACEScct 2.0からAEが未起動の状態で送ると、R2AEが `color/r2ae-aces-project.aet` を開き、新規AEプロジェクトに取り込みます。テンプレートは32 bpc、ACES/ACEScg、`sRGB - Display / ACES 2.0 - SDR 100 nits (Rec.709)` です。AEが起動中の場合は現在のプロジェクトに取り込みます。書き出しのODTはAEで設定します。
+
+ResolveのAPIがACESバージョンを返さない場合、ACEScctのコールド起動は既定でACES 2.0として扱います。ACES 1.xと併用する場合は `ASSUME_ACES_2_ON_COLD_START` を `false` にできます。
+
+ResolveのACES 2.0（ACESccまたはACEScct）から、クリップまたはプロジェクト既定のIDTを取得します。Sony、ARRI、Blackmagic、Canon、RED、ACEScg／ACES2065-1、および検証済みのRec.709／sRGB逆変換に対応します。正確な項目名は[ResolveとAEのIDT対応表](docs/IDT.ja.md)を参照してください。入力色空間は素材ごとに **フッテージを変換 > カラー** に保存されます。同梱のAEプロジェクトと参照クリップは転送時のプリセットに使用し、保存後のAEプロジェクトは元の素材を参照します。
+
+ResolveのODTはコンポのコメントに記録します。プリセット適用時にピクセル縦横比などの素材属性を維持できない場合は、素材の元の解釈を保持し、IDTの手動設定が必要な項目として通知します。未対応のIDTも通知の対象です。
+
 ## 設定項目
 
 `r2ae.lua` 冒頭の変数で挙動を変更できます。

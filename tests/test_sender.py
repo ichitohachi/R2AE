@@ -13,13 +13,16 @@ class SenderTests(unittest.TestCase):
     def run_sender(self, fps='29.97 DF', start=107892, span=(120000,120050),
                    srcfps='59.94', interlace='0', reverse=False, audio=True,
                    overrides='', source=SOURCE, drop=None, selection=None, fcpxml=None,
-                   camera_fps=None):
+                   camera_fps=None, color_science=None, clip_idt=None, project_idt=None):
         lua = LuaRuntime(unpack_returned_tuples=True)
         lua.globals().FPS = fps
         lua.globals().START = start
         lua.globals().FIRST, lua.globals().LAST = span
         lua.globals().SRCFPS = srcfps
         lua.globals().CAMERAFPS = camera_fps
+        lua.globals().COLOR_SCIENCE = color_science
+        lua.globals().CLIP_IDT = clip_idt
+        lua.globals().PROJECT_IDT = project_idt
         lua.globals().INTERLACE = interlace
         lua.globals().DROP = drop
         lua.globals().REVERSE = reverse
@@ -53,6 +56,7 @@ class SenderTests(unittest.TestCase):
             timelineInputResMismatchBehavior="scaleToCrop"}
         local props = {["File Path"]="/mock/test.mov",["FPS"]=SRCFPS,
             ["Camera FPS"]=CAMERAFPS,
+            ["IDT"]=CLIP_IDT,
             ["Frames"]="1000",["Resolution"]="1920x1080",
             ["Start TC"]="01:00:00;00",["Field Dominance"]="Upper Field First"}
         local mpi = {GetClipProperty=function() return props end}
@@ -111,7 +115,9 @@ class SenderTests(unittest.TestCase):
         end
         local project = {
             GetSetting=function() return {timelineFrameRate="24",timelineResolutionWidth="1920",
-                timelineResolutionHeight="1080",timelineInputResMismatchBehavior="scaleToFit"} end,
+                timelineResolutionHeight="1080",timelineInputResMismatchBehavior="scaleToFit",
+                colorScienceMode=COLOR_SCIENCE, acesVersion="aces_2.0", colorAcesIDT=PROJECT_IDT,
+                colorAcesODT="Rec.709 - 100 nits"} end,
             GetCurrentTimeline=function() return timeline end
         }
         resolve = {GetProjectManager=function() return {GetCurrentProject=function() return project end} end}
@@ -156,6 +162,19 @@ class SenderTests(unittest.TestCase):
         self.assertAlmostEqual(d['clips'][0]['camera_fps'], 24000 / 1001)
         self.assertEqual(d['clips'][0]['source_rotation'], -90)
         self.assertNotIn('source_rotation', self.run_sender()['clips'][0])
+
+    def test_aces_sends_clip_idt_or_the_project_default_and_records_odt(self):
+        params = dict(color_science='acescct', project_idt='ARRI LogC4 - CSC')
+        with_override = self.run_sender(**params, clip_idt='Sony SLog3 SGamut3Cine - CSC')
+        self.assertEqual(with_override['aces'], {
+            'mode': 'acescct', 'version': 'aces_2.0', 'odt': 'Rec.709 - 100 nits'
+        })
+        self.assertEqual(with_override['clips'][0]['src_idt'], 'Sony SLog3 SGamut3Cine - CSC')
+        inherited = self.run_sender(**params, clip_idt='Use Project Setting')
+        self.assertEqual(inherited['clips'][0]['src_idt'], 'ARRI LogC4 - CSC')
+        rcm = self.run_sender(color_science='davinciYRGBColorManagedv2', clip_idt='ARRI LogC4 - CSC')
+        self.assertNotIn('aces', rcm)
+        self.assertNotIn('src_idt', rcm['clips'][0])
 
     def test_selection_audio_only(self):
         d = self.run_sender(selection='audio')

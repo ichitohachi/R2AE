@@ -9,7 +9,8 @@
 //   「スクリプトによるファイルへの書き込みとネットワークへのアクセスを許可」をON
 
 (function resolveToAE() {
-    var JSON_PATH = Folder("~/Documents/ae_bridge").fsName + "/r2ae.json";
+    var BRIDGE_DIR = Folder("~/Documents/ae_bridge").fsName;
+    var JSON_PATH = BRIDGE_DIR + "/r2ae.json";
 
     // ExtendScriptはJSON.parseがない環境もある。evalせずJSON文法のみを読む。
     function parseJSON(text) {
@@ -94,6 +95,203 @@
         }
     }
 
+    var STUDIO_CONFIG = "ACES 2.0 Studio v4.0";
+    var ACES_INPUT_PRESETS = {
+        sonyslog3sgamut3: "sony-gamut3",
+        sonysgamut3slog3: "sony-gamut3",
+        slog3sgamut3: "sony-gamut3",
+        sonyslog3sgamut3cine: "sony-cine",
+        sonysgamut3cineslog3: "sony-cine",
+        slog3sgamut3cine: "sony-cine",
+        sonyveniceslog3sgamut3: "sony-venice-gamut3",
+        sonyslog3venicesgamut3: "sony-venice-gamut3",
+        slog3venicesgamut3: "sony-venice-gamut3",
+        sonyveniceslog3sgamut3cine: "sony-venice-cine",
+        sonyslog3venicesgamut3cine: "sony-venice-cine",
+        slog3venicesgamut3cine: "sony-venice-cine",
+        arrilogc3: "arri-logc3",
+        arrilogc3ei800: "arri-logc3",
+        arrialexav3logcei800: "arri-logc3",
+        arriwidegamut3logc3ei800: "arri-logc3",
+        arrilogc4: "arri-logc4",
+        arriwidegamut4logc4: "arri-logc4",
+        arrilogc4arriwidegamut4: "arri-logc4",
+        acescg: "acescg",
+        aces20651: "aces2065-1",
+        blackmagicdesignfilmgen5csc: "bmd-film-gen5",
+        canonlog2cinemagamutcsc: "canon-log2-cinemagamut",
+        canonlog3cinemagamutcsc: "canon-log3-cinemagamut",
+        redlog3g10redwidegamutrgbcsc: "red-log3g10-rwg",
+        inverserec709bt1886: "inverse-rec709-bt1886",
+        inversesrgbpiecewise: "inverse-srgb-piecewise"
+    };
+
+    function acesInputPreset(c) {
+        if (c.kind !== "video") return null;
+        var key = String(c.src_idt || "").toLowerCase().replace(/[^a-z0-9]/g, "");
+        if (ACES_INPUT_PRESETS.hasOwnProperty(key)) return ACES_INPUT_PRESETS[key];
+        var base = key.replace(/csc$/, "");
+        return ACES_INPUT_PRESETS.hasOwnProperty(base) ? ACES_INPUT_PRESETS[base] : null;
+    }
+
+    function supportsAces2() {
+        var version = /^(\d+)\.(\d+)/.exec(app.version || "");
+        return version && (+version[1] > 26 || (+version[1] === 26 && +version[2] >= 5));
+    }
+
+    function openAcesStartupProject(d, notices) {
+        if ($.global.r2aeColdStart !== true || !d.aces || d.aces.mode !== "acescct") return;
+        var resolveVersion = String(d.aces.version || "");
+        if (resolveVersion && !/^(?:aces[ _-]*)?2\.0$/i.test(resolveVersion)) return;
+        if (!supportsAces2()) {
+            notices.push("ACES 2.0プロジェクトテンプレートにはAfter Effects 26.5以降が必要です");
+            return;
+        }
+
+        // 既存プロジェクトを開いている場合や、AEが復元した場合は現在のプロジェクトを使う。
+        var current = app.project;
+        if (current && (current.file || current.numItems !== 0 || current.dirty)) {
+            notices.push("起動時に開いていたAEプロジェクトへ転送します");
+            return;
+        }
+        var template = new File(BRIDGE_DIR + "/color/r2ae-aces-project.aet");
+        if (!template.exists) {
+            notices.push("ACES 2.0プロジェクトテンプレートが見つかりません");
+            return;
+        }
+        try {
+            if (typeof app.openTemplate !== "function" || !app.openTemplate(template)) {
+                throw new Error("テンプレートから新規プロジェクトを作成できません");
+            }
+        } catch (e) {
+            notices.push("ACES 2.0プロジェクトを開けません: " + e.toString());
+        }
+    }
+
+    function configureAces(d, notices) {
+        if (!d.aces) return null;
+        var resolveVersion = String(d.aces.version || "");
+        if (resolveVersion && !/^(?:aces[ _-]*)?2\.0$/i.test(resolveVersion)) return null;
+        var hasSupportedInput = false;
+        for (var i = 0; i < d.clips.length; i++) {
+            var c = d.clips[i];
+            if (c.kind !== "video") continue;
+            if (acesInputPreset(c)) hasSupportedInput = true;
+            else notices.push(c.name + ": IDTをAEで確認してください（" + (c.src_idt || "ResolveのIDT不明") + "）");
+        }
+        if (!hasSupportedInput) return null;
+        if (!supportsAces2()) {
+            notices.push("ACES 2.0のIDTを引き継ぐにはAfter Effects 26.5以降が必要です");
+            return null;
+        }
+
+        var template = new File(BRIDGE_DIR + "/color/r2ae-aces-inputs.aep");
+        if (!template.exists || !new File(BRIDGE_DIR + "/color/r2ae-color-reference.mov").exists) {
+            notices.push("IDTプリセットが見つかりません。colorフォルダを受信スクリプトと同じ階層に配置してください");
+            return null;
+        }
+
+        var project = app.project;
+        if (project.colorManagementSystem === 1 && project.ocioConfigurationFile === STUDIO_CONFIG) return template;
+        // ResolveのAPIがACESバージョンを空で返す場合は、AEの設定でACES 2.0を確認する。
+        if (!resolveVersion || project.file || project.numItems !== 0) {
+            notices.push("IDTを引き継ぐにはAE標準のACES 2.0 Studio v4.0を選択してください");
+            return null;
+        }
+        var previousEngine = project.colorManagementSystem;
+        var previousConfig = project.ocioConfigurationFile;
+        var previousDepth = project.bitsPerChannel;
+        try {
+            project.colorManagementSystem = 1;
+            project.ocioConfigurationFile = STUDIO_CONFIG;
+            project.bitsPerChannel = 32;
+            if (project.ocioConfigurationFile !== STUDIO_CONFIG) throw new Error("ACES 2.0 Studio v4.0を設定できません");
+            notices.push("AEのWorking Color Spaceで ACES/ACEScg を選択してください");
+            return template;
+        } catch (e) {
+            project.colorManagementSystem = previousEngine;
+            project.ocioConfigurationFile = previousConfig;
+            project.bitsPerChannel = previousDepth;
+            notices.push("AEでIDTを自動設定できません: " + e.toString());
+            return null;
+        }
+    }
+
+    // AEの素材差し替えは、プリセットに設定済みのOCIO入力色空間を保持する。
+    function applyAcesInput(footage, src, c, template, notices) {
+        var preset = acesInputPreset(c);
+        if (!template || !preset || !footage.hasVideo) return footage;
+        var folder = null;
+        try {
+            var options = new ImportOptions(template);
+            options.importAs = ImportAsType.PROJECT;
+            var root = app.project.rootFolder;
+            var existing = {};
+            for (var i = 1; i <= root.numItems; i++) existing[root.item(i).id] = true;
+            app.beginSuppressDialogs();
+            try { app.project.importFile(options); }
+            finally { app.endSuppressDialogs(false); }
+
+            // Undoグループ内でのプロジェクト読み込みは、戻り値が別の項目を指すことがある。
+            for (var i = 1; i <= root.numItems; i++) {
+                var candidate = root.item(i);
+                if (candidate instanceof FolderItem && !existing[candidate.id]) {
+                    folder = candidate;
+                    break;
+                }
+            }
+            if (!folder) throw new Error("IDTプリセットを読み込めません");
+            var assigned = null;
+            for (var i = 1; i <= folder.numItems; i++) {
+                var item = folder.item(i);
+                if (item.name === preset) {
+                    assigned = item;
+                    break;
+                }
+            }
+            if (!assigned) throw new Error("IDTプリセットが見つかりません");
+            if (c.is_sequence) assigned.replaceWithSequence(src, false);
+            else assigned.replace(src);
+
+            var original = footage.mainSource;
+            var replacement = assigned.mainSource;
+            if (assigned.footageMissing || assigned.width !== footage.width || assigned.height !== footage.height
+                || assigned.pixelAspect !== footage.pixelAspect || assigned.hasAudio !== footage.hasAudio
+                || replacement.hasAlpha !== original.hasAlpha || replacement.isStill !== original.isStill) {
+                throw new Error("素材の映像・音声属性が一致しません");
+            }
+            if (original.hasAlpha) {
+                replacement.alphaMode = original.alphaMode;
+                if (original.alphaMode === AlphaMode.PREMULTIPLIED) replacement.premulColor = original.premulColor;
+                replacement.invertAlpha = original.invertAlpha;
+            }
+            if (!original.isStill) {
+                replacement.fieldSeparationType = original.fieldSeparationType;
+                if (original.fieldSeparationType !== FieldSeparationType.OFF) {
+                    replacement.highQualityFieldSeparation = original.highQualityFieldSeparation;
+                }
+                replacement.removePulldown = original.removePulldown;
+                if (replacement.conformFrameRate !== original.conformFrameRate) {
+                    replacement.conformFrameRate = original.conformFrameRate;
+                }
+                replacement.loop = original.loop;
+                if (Math.abs(assigned.duration - footage.duration) > 0.00001
+                    || Math.abs(assigned.frameRate - footage.frameRate) > 0.00001) {
+                    throw new Error("素材の尺またはfpsが一致しません");
+                }
+            }
+            assigned.name = footage.name;
+            assigned.parentFolder = footage.parentFolder;
+            footage.remove();
+            return assigned;
+        } catch (e) {
+            notices.push(c.name + ": AEでIDTを確認してください（" + e.toString() + "）");
+            return footage;
+        } finally {
+            if (folder instanceof FolderItem) folder.remove();
+        }
+    }
+
     // この転送内だけで再利用。既存コンプの手動解釈/プロキシに影響されない。
     var imported = {};
     var sourcePrecomps = {};
@@ -108,7 +306,7 @@
     }
     function footageKey(path, c) {
         var rate = c.is_sequence || cameraRateCorrection(c) ? c.src_fps : "auto";
-        return path + "|" + !!c.is_sequence + "|" + rate + "|" + c.src_field;
+        return path + "|" + !!c.is_sequence + "|" + rate + "|" + c.src_field + "|" + (acesInputPreset(c) || "");
     }
     function fieldMode(value) {
         var v = String(value || "").toLowerCase();
@@ -497,14 +695,15 @@
     if (!(d.fps > 0) || !(d.width > 0) || !(d.height > 0) || !(d.duration > 0)) {
         alert("タイムライン設定または尺が不正です"); return;
     }
-    app.beginUndoGroup("Import from DaVinci Resolve");
-
     var failed = [];
     var retimed = [];
     var notices = d.warnings || [];
+    openAcesStartupProject(d, notices);
+    app.beginUndoGroup("Import from DaVinci Resolve");
 
     try {
         if (!app.project) app.newProject();
+        var acesTemplate = configureAces(d, notices);
 
         var fps = d.fps || 24;
         var compDur = d.duration / fps;
@@ -530,6 +729,7 @@
             + " / interlaced=" + d.interlaced
             + (d.display_start_frame != null ? " / Resolve開始フレーム=" + d.display_start_frame
                  : " / Resolve開始秒=" + d.display_start_time);
+        if (d.aces && d.aces.odt) comp.comment += "\nResolve ODT（AEで手動設定）: " + d.aces.odt;
 
         var clips = layerImportOrder(d.clips);
         for (var i = 0; i < clips.length; i++) {
@@ -592,8 +792,10 @@
                             }
                         }
                     }
+                    footage = applyAcesInput(footage, src, c, acesTemplate, notices);
                     footage.comment = "Resolve FPS=" + c.src_fps_raw + " / Start TC=" + c.src_start_tc
                         + " / Field=" + c.src_field;
+                    if (c.src_idt) footage.comment += " / Resolve IDT=" + c.src_idt;
                     imported[cacheKey] = footage;
                 }
 

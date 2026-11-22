@@ -77,6 +77,10 @@ local RESPECT_TRACK_ENABLE = true
 local RESPECT_CLIP_ENABLE = true
 
 
+-- ResolveのAPIがACESバージョンを返さないとき、ACEScctのコールド起動にACES 2.0を使う。
+-- ACES 1.xと併用する場合はfalseにする。
+local ASSUME_ACES_2_ON_COLD_START = true
+
 -- ---- ユーティリティ ----------------------------------------------------
 
 local function file_exists(path)
@@ -175,6 +179,23 @@ local function setting(key)
     if v ~= nil and v ~= "" then return v end
     return projectSettings[key]
 end
+local colorScience = setting("colorScienceMode")
+local acesVersion = tostring(setting("acesVersion") or "")
+local isAces = colorScience == "acescc" or colorScience == "acescct"
+local projectIDT = setting("colorAcesIDT")
+local projectODT = setting("colorAcesODT")
+
+local function clipIDT(props)
+    local idt = tostring(props["IDT"] or ""):match("^%s*(.-)%s*$")
+    local value = idt:lower()
+    if value == "" or value == "project" or value == "project setting"
+        or value == "project settings" or value == "use project setting"
+        or value == "use project settings" or value == "same as project" then
+        return tostring(projectIDT or "")
+    end
+    return idt
+end
+
 local function as_bool(v)
     if v == true or v == 1 or v == "1" or v == "true" then return true end
     if v == false or v == 0 or v == "0" or v == "false" then return false end
@@ -443,6 +464,7 @@ local function collect_track(trackType, trackIndex)
                             src_fps_raw = tostring(props["FPS"] or ""),
                             src_start_tc = tostring(props["Start TC"] or ""),
                             src_field = tostring(props["Field Dominance"] or ""),
+                            src_idt = isAces and clipIDT(props) or nil,
                             src_w = sw,
                             src_h = sh,
                             is_sequence = isSequence,
@@ -727,7 +749,6 @@ read_transform_keys(finalList)
 -- ---- JSON書き出し --------------------------------------------------------
 
 ensure_dir(BRIDGE_DIR)
-
 local parts = {}
 for _, c in ipairs(finalList) do
     local extra = string.format(', "src_fps_raw": "%s", "src_start_tc": "%s", "src_field": "%s"',
@@ -737,6 +758,9 @@ for _, c in ipairs(finalList) do
     end
     if c.camera_fps then
         extra = extra .. string.format(', "camera_fps": %s', tostring(c.camera_fps))
+    end
+    if c.src_idt then
+        extra = extra .. string.format(', "src_idt": "%s"', json_escape(c.src_idt))
     end
     local sourceRotation = c.kind == "video" and SOURCE_ROTATION_BY_PATH[c.path]
     if sourceRotation == 90 or sourceRotation == -90 or sourceRotation == 180 then
@@ -785,9 +809,16 @@ local warningJSON = {}
 for _, message in ipairs(warnings) do
     warningJSON[#warningJSON + 1] = '"' .. json_escape(message) .. '"'
 end
+local colorJSON = ""
+if isAces then
+    colorJSON = string.format(
+        '\n  "aces": {"mode": "%s", "version": "%s", "odt": "%s"},',
+        json_escape(colorScience), json_escape(acesVersion), json_escape(tostring(projectODT or ""))
+    )
+end
 local json = string.format(
 [[{
-  "schema_version": 2,
+  "schema_version": 2,%s
   "comp_name": "%s",
   "width": %d,
   "height": %d,
@@ -807,6 +838,7 @@ local json = string.format(
 %s
   ]
 }]],
+    colorJSON,
     json_escape(timeline:GetName() .. "_AE"),
     compW, compH, tostring(compFps), totalDuration / ticksPerFrame, inputScaling,
     tostring(dropFrame), minStart % ticksPerFrame == 0 and tostring(minStart / ticksPerFrame) or "null",
@@ -903,9 +935,21 @@ else
         print("After Effectsが見つかりません")
         return
     end
-    local cmd = "osascript -e " .. shell_quote("tell application " .. apple_quote(aeName) .. " to activate")
-        .. " -e " .. shell_quote("tell application " .. apple_quote(aeName)
-        .. " to DoScriptFile POSIX file " .. apple_quote(JSX_PATH))
+    local target = "application " .. apple_quote(aeName)
+    local receiveFile = "DoScriptFile POSIX file " .. apple_quote(JSX_PATH)
+    local version = acesVersion:lower():gsub("^aces[%s_%-]*", "")
+    local useStartupTemplate = colorScience == "acescct"
+        and (version == "2.0" or (version == "" and ASSUME_ACES_2_ON_COLD_START))
+    local script = "tell " .. target .. "\nactivate\n" .. receiveFile .. "\nend tell"
+    if useStartupTemplate then
+        local receiveCold = "(function(){ $.global.r2aeColdStart = true; " ..
+            'try { $.evalFile("' .. json_escape(JSX_PATH) .. '"); } ' ..
+            "finally { delete $.global.r2aeColdStart; } }());"
+        script = "set alreadyRunning to (" .. target .. " is running)\n" ..
+            "tell " .. target .. "\nactivate\nif alreadyRunning then\n" ..
+            receiveFile .. "\nelse\nDoScript " .. apple_quote(receiveCold) .. "\nend if\nend tell"
+    end
+    local cmd = "osascript -e " .. shell_quote("with timeout of 300 seconds\n" .. script .. "\nend timeout")
     local result = os.execute(cmd)
     sent = result == true or result == 0
 end

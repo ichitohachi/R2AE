@@ -6,19 +6,35 @@ const path = require('node:path');
 const source = fs.readFileSync(path.join(__dirname,'../r2ae_receive.jsx'),'utf8');
 let checks=0;
 function run(data, options={}) {
-    const state={comps:[],imports:[],alerts:[],undo:0,importOptions:[]};
+    const state={comps:[],imports:[],alerts:[],undo:0,importOptions:[],presetFolders:[]};
     const document=typeof data==='string'?data:JSON.stringify(data);
-    function File(name) { this.fsName=name; this.exists=true; this.name=name; }
+    function File(name) {
+        this.fsName=name;this.name=path.basename(name);
+        this.exists=!name.startsWith('/mock/color/')||!options.missingColorAssets;
+    }
     File.prototype.open=function(){return true;};
     File.prototype.read=function(){return document;};
-    File.prototype.close=function(){};
-    function Folder(){return {fsName:'/mock'};}
-    function FolderItem(){}
+    File.prototype.close=function(){return true;};
+    function Folder(name){return {fsName:name==='~/Documents/ae_bridge'?'/mock':name};}
+    let nextID=1;
+    function FolderItem(items=[]){this.id=nextID++;this.items=items;}
+    Object.defineProperty(FolderItem.prototype,'numItems',{get(){return this.items.length;}});
+    FolderItem.prototype.item=function(i){return this.items[i-1];};
+    FolderItem.prototype.remove=function(){this.removed=true;};
+    const rootFolder=new FolderItem();
     function FileSource(){this.isStill=!!options.still;this.conformFrameRate=0;this.fieldSeparationType='importer';}
     function FootageItem(){this.mainSource=new FileSource();this.nativeFps=options.nativeFps||60000/1001;
-        this.id=state.imports.length+1;this.name='movie';
+        this.id=nextID++;this.name='movie';
         this.hasVideo=options.hasVideo!==false;this.duration=options.sourceDuration||100;
-        this.width=options.width||1920;this.height=options.height||1080;}
+        this.width=options.width||1920;this.height=options.height||1080;this.pixelAspect=1;}
+    FootageItem.prototype.remove=function(){this.removed=true;};
+    FootageItem.prototype.replace=function(file){
+        this.mainSource.file=file;
+        if(options.replacementPAR) this.pixelAspect=options.replacementPAR;
+    };
+    FootageItem.prototype.replaceWithSequence=function(file){
+        this.replace(file);this.sequence=true;this.mainSource.conformFrameRate=24;
+    };
     Object.defineProperty(FootageItem.prototype,'frameRate',{
         get(){return this.mainSource.conformFrameRate||this.nativeFps;},
         set(value){this.nativeFps=value;}
@@ -38,7 +54,8 @@ function run(data, options={}) {
             }};
     }
     const app={beginUndoGroup(){state.undo++;},endUndoGroup(){state.undo--;},
-        project:{numItems:1,item(){return existing;},items:{
+        beginSuppressDialogs(){},endSuppressDialogs(){},
+        project:{numItems:options.numItems??1,rootFolder,item(){return existing;},items:{
             addFolder(){return new FolderItem();},
             addComp(name,w,h,par,duration,fps){
                 const comp={name,width:w,height:h,pixelAspect:par,duration,frameRate:fps,
@@ -64,11 +81,35 @@ function run(data, options={}) {
                     comp.list.push(layer);return layer;
                 }};state.comps.push(comp);return comp;
             }},
-            importFile(io){state.importOptions.push(io);const f=new FootageItem();f.mainSource.file=io.file;state.imports.push(f);return f;}
+            importFile(io){
+                if(io.importAs===2){
+                    const seeds=['sony-cine','arri-logc3','arri-logc4','acescg','aces2065-1',
+                        'bmd-film-gen5','canon-log2-cinemagamut','canon-log3-cinemagamut',
+                        'red-log3g10-rwg','inverse-rec709-bt1886','inverse-srgb-piecewise'].map(name=>{
+                        const f=new FootageItem(); f.name=name; f.preset=name; return f;
+                    });
+                    const folder=new FolderItem(seeds);
+                    rootFolder.items.push(folder);
+                    state.presetFolders.push(folder);
+                    return existing; // AE 26.5 may return a previous item within an undo group.
+                }
+                state.importOptions.push(io);
+                const f=new FootageItem();f.mainSource.file=io.file;state.imports.push(f);return f;
+            }
         }};
+    Object.assign(app.project,{colorManagementSystem:0,ocioConfigurationFile:'',bitsPerChannel:8},options.color);
+    state.project=app.project;
+    app.openTemplate=function(file){
+        assert.equal(state.undo,0,'The template must open before the import undo group');
+        state.templateOpened=file.fsName;
+        return Object.assign(app.project,{
+            colorManagementSystem:1,ocioConfigurationFile:'ACES 2.0 Studio v4.0',bitsPerChannel:32
+        });
+    };
     function ImportOptions(file){this.file=file;this.canImportAs=()=>true;}
+    app.version=options.version||'26.5x89';
     const context={File,Folder,FolderItem,FileSource,FootageItem,ImportOptions,app,
-        alert:s=>state.alerts.push(s),$: {os:options.os||'Macintosh'},ImportAsType:{FOOTAGE:1},
+        alert:s=>state.alerts.push(s),$: {os:options.os||'Macintosh',global:{r2aeColdStart:options.coldStart}},ImportAsType:{FOOTAGE:1,PROJECT:2},
         FieldSeparationType:{OFF:0,UPPER_FIELD_FIRST:1,LOWER_FIELD_FIRST:2},
         KeyframeInterpolationType:{LINEAR:1}};
     vm.runInNewContext(source,context);
@@ -114,6 +155,93 @@ test('camera-confirmed fractional fps corrects AE rounding to whole fps',()=>{
     assert.equal(deliberate.comps[0].list[0].property('ADBE Time Remapping').keys.length,2);
     assert.equal(deliberate.alerts.length,1);
     assert.match(deliberate.alerts[0],/素材fps=.*Time Remap/);
+});
+test('A cold ACEScct transfer opens the project template before footage import',()=>{
+    const d=fixture({aces:{mode:'acescct',version:''}});
+    d.clips[0].src_idt='ARRI LogC3';
+    const s=run(d,{numItems:0,coldStart:true});
+    assert.equal(s.templateOpened,'/mock/color/r2ae-aces-project.aet');
+    assert.equal(s.project.bitsPerChannel,32);
+    assert.equal(s.comps[0].list[0].footage.preset,'arri-logc3');
+    assert.deepEqual(s.alerts,[]);
+});
+test('Warm, older ACES and restored projects skip the startup template',()=>{
+    const d=fixture({aces:{mode:'acescct',version:''}});
+    d.clips[0].src_idt='ARRI LogC3';
+    assert.equal(run(d,{numItems:0}).templateOpened,undefined);
+    const restored=run(d,{numItems:0,coldStart:true,color:{file:{fsName:'/saved.aep'}}});
+    assert.equal(restored.templateOpened,undefined);
+    d.aces.version='aces_1.3';
+    assert.equal(run(d,{numItems:0,coldStart:true}).templateOpened,undefined);
+});
+test('ACES 2.0 uses the stock configuration and assigns different IDTs to the same source',()=>{
+    const d=fixture({aces:{version:'aces_2.0',mode:'acescct',odt:'Rec.709 - 100 nits'}});
+    Object.assign(d.clips[0],{src_idt:'Sony SLog3 SGamut3Cine - CSC'});
+    d.clips.push({...d.clips[0],name:'other IDT',src_idt:'ARRI LogC4 - CSC'});
+    const s=run(d,{numItems:0});
+    assert.equal(s.project.colorManagementSystem,1);
+    assert.equal(s.project.ocioConfigurationFile,'ACES 2.0 Studio v4.0');
+    assert.equal(s.project.bitsPerChannel,32);
+    assert.match(s.alerts[0],/Working Color Space.*ACEScg/);
+    assert.match(s.comps[0].comment,/Resolve ODT.*Rec\.709/);
+    assert.deepEqual(s.comps[0].list.map(l=>l.footage.preset),['sony-cine','arri-logc4']);
+    assert.match(s.comps[0].list[0].footage.comment,/Sony SLog3 SGamut3Cine/);
+    assert.ok(s.presetFolders.every(f=>f.removed));
+});
+test('ACES maps the verified camera and inverse display variants',()=>{
+    const color={colorManagementSystem:1,ocioConfigurationFile:'ACES 2.0 Studio v4.0'};
+    const d=fixture({aces:{mode:'acescct'}});
+    for(const [idt,preset] of [
+        ['Blackmagic Design Film Gen 5 - CSC','bmd-film-gen5'],
+        ['Canon Log 2 Cinema Gamut - CSC','canon-log2-cinemagamut'],
+        ['Canon Log 3 Cinema Gamut - CSC','canon-log3-cinemagamut'],
+        ['RED Log3G10 REDWideGamutRGB - CSC','red-log3g10-rwg'],
+        ['Inverse Rec.709 BT.1886','inverse-rec709-bt1886'],
+        ['Inverse sRGB Piecewise','inverse-srgb-piecewise'],
+        ['Inverse Rec.709 BT.1886 (D60 simulation)',undefined],
+        ['Inverse sRGB Gamma 2.2',undefined],
+        ['sRGB',undefined],
+        ['Rec.709',undefined],
+        ['Canon Log 2 Rec.2020 - CSC',undefined],
+        ['Fujifilm F-Log2',undefined],
+    ]){
+        d.clips[0].src_idt=idt;
+        const state=run(d,{color});
+        assert.equal(state.comps[0].list[0].footage.preset,preset,idt);
+        if(!preset) assert.ok(state.alerts[0].includes(idt));
+    }
+});
+test('ACES preserves sequence fps and falls back when the preset changes pixel aspect',()=>{
+    const d=fixture({aces:{version:'ACES 2.0'}});
+    Object.assign(d.clips[0],{path:'/exr/0001.exr',is_sequence:true,src_fps:25,src_idt:'ACEScg - CSC'});
+    const color={colorManagementSystem:1,ocioConfigurationFile:'ACES 2.0 Studio v4.0'};
+    const ok=run(d,{color});
+    const footage=ok.comps[0].list[0].footage;
+    assert.equal(footage.preset,'acescg');
+    assert.equal(footage.sequence,true);
+    assert.equal(footage.frameRate,25);
+    const fallback=run(d,{color,replacementPAR:2});
+    assert.equal(fallback.comps[0].list[0].footage,fallback.imports[0]);
+    assert.match(fallback.alerts[0],/IDTを確認.*映像・音声属性/);
+    assert.ok(fallback.presetFolders.every(f=>f.removed));
+});
+test('ACES with no Resolve version uses LogC3 only in a stock ACES 2.0 project',()=>{
+    const d=fixture({aces:{mode:'acescct',version:''}});
+    d.clips[0].src_idt='ARRI LogC3';
+    const blank=run(d,{numItems:0});
+    assert.equal(blank.presetFolders.length,0);
+    assert.match(blank.alerts[0],/AE標準のACES 2.0 Studio/);
+    const stock=run(d,{color:{colorManagementSystem:1,ocioConfigurationFile:'ACES 2.0 Studio v4.0'}});
+    assert.equal(stock.comps[0].list[0].footage.preset,'arri-logc3');
+});
+test('ACES keeps existing unrelated project settings',()=>{
+    const d=fixture({aces:{version:'aces_2.0'}});
+    d.clips[0].src_idt='ARRI LogC3 (EI800) - CSC';
+    const s=run(d,{color:{colorManagementSystem:1,ocioConfigurationFile:'Pipeline.ocio'}});
+    assert.equal(s.project.ocioConfigurationFile,'Pipeline.ocio');
+    assert.equal(s.presetFolders.length,0);
+    assert.match(s.alerts[0],/AE標準のACES 2.0 Studio/);
+    assert.equal(s.comps[0].list.length,1);
 });
 test('video order follows start times from the bottom while overlapping upper tracks stay above',()=>{
     const video=(name,track,offset,duration,extra={})=>({

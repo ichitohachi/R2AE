@@ -85,6 +85,18 @@ The composition starts at the earliest transferred clip's timecode and preserves
 
 If Windows automation fails, open `r2ae_receive.jsx` via File > Scripts > Run Script File in After Effects to import the exported JSON.
 
+### ACES 2.0 input transforms
+
+For IDT transfer, copy the repository's `color` folder next to the installed receiver. Use After Effects 26.5 or later with its built-in **ACES 2.0 Studio v4.0** configuration and **ACES/ACEScg** as Working Color Space.
+
+On macOS, sending from ACEScct 2.0 while AE is closed launches AE and imports into a new project based on `color/r2ae-aces-project.aet`. This template uses 32 bpc, ACES/ACEScg, and `sRGB - Display / ACES 2.0 - SDR 100 nits (Rec.709)`. Transfers to an already running AE use its current project. Set the render output transform in AE.
+
+If Resolve does not report its ACES version, R2AE defaults to ACES 2.0 for ACEScct cold starts. Set `ASSUME_ACES_2_ON_COLD_START` to `false` if you also work in ACES 1.x.
+
+R2AE reads the Resolve clip or project IDT in an ACES 2.0 project (ACEScc or ACEScct). Supported transforms include Sony, ARRI, Blackmagic, Canon, RED, ACEScg, ACES2065-1, and verified inverse display transforms for Rec.709 and sRGB. See the [Resolve–AE IDT table (Japanese)](docs/IDT.ja.md) for exact names. The input override is saved with each footage item in **Interpret Footage > Color**. The bundled AE project and reference clip supply the input presets during transfer. Saved projects link directly to the original media.
+
+R2AE records the Resolve ODT in the comp comment for reference. If a preset would change source attributes such as pixel aspect, R2AE keeps the source's native interpretation and reports the clip for manual IDT assignment. Unsupported inputs are also reported.
+
 ## Configuration
 
 Behavior can be changed via variables at the top of `r2ae.lua`.
