@@ -57,6 +57,13 @@ local INPUT_SCALING = "auto"
 -- （実測により既定を -1 にしている）
 local ROTATION_SIGN = -1
 
+-- Clip AttributesのImage OrientationはAPIから取得できない。
+-- 必要な場合、AEで読み込んだ向きからの追加回転を素材の絶対パスごとに指定。
+-- 90 = 時計回り、-90 = 反時計回り、180 = 上下反転。
+local SOURCE_ROTATION_BY_PATH = {
+    -- ["/path/to/clip.mov"] = 90,
+}
+
 -- 速度変更（リタイム）をAEのタイムリマップに反映するか
 local ENABLE_SPEED = true
 
@@ -432,6 +439,7 @@ local function collect_track(trackType, trackIndex)
                             mute_audio = false,
                             speed = speed,
                             src_fps = srcFps,
+                            camera_fps = not isSequence and parse_fps(props["Camera FPS"]) or nil,
                             src_fps_raw = tostring(props["FPS"] or ""),
                             src_start_tc = tostring(props["Start TC"] or ""),
                             src_field = tostring(props["Field Dominance"] or ""),
@@ -726,6 +734,13 @@ for _, c in ipairs(finalList) do
         json_escape(c.src_fps_raw), json_escape(c.src_start_tc), json_escape(c.src_field))
     if c.src_fps then
         extra = extra .. string.format(', "src_fps": %s', tostring(c.src_fps))
+    end
+    if c.camera_fps then
+        extra = extra .. string.format(', "camera_fps": %s', tostring(c.camera_fps))
+    end
+    local sourceRotation = c.kind == "video" and SOURCE_ROTATION_BY_PATH[c.path]
+    if sourceRotation == 90 or sourceRotation == -90 or sourceRotation == 180 then
+        extra = extra .. string.format(', "source_rotation": %d', sourceRotation)
     end
     if c.src_w and c.src_h then
         extra = extra .. string.format(', "src_w": %d, "src_h": %d', c.src_w, c.src_h)

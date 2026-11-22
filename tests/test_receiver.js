@@ -14,9 +14,15 @@ function run(data, options={}) {
     File.prototype.close=function(){};
     function Folder(){return {fsName:'/mock'};}
     function FolderItem(){}
-    function FileSource(){this.isStill=false;this.conformFrameRate=0;this.fieldSeparationType='importer';}
-    function FootageItem(){this.mainSource=new FileSource();this.frameRate=options.nativeFps||60000/1001;
-        this.hasVideo=options.hasVideo!==false;this.duration=options.sourceDuration||100;this.width=1920;this.height=1080;}
+    function FileSource(){this.isStill=!!options.still;this.conformFrameRate=0;this.fieldSeparationType='importer';}
+    function FootageItem(){this.mainSource=new FileSource();this.nativeFps=options.nativeFps||60000/1001;
+        this.id=state.imports.length+1;this.name='movie';
+        this.hasVideo=options.hasVideo!==false;this.duration=options.sourceDuration||100;
+        this.width=options.width||1920;this.height=options.height||1080;}
+    Object.defineProperty(FootageItem.prototype,'frameRate',{
+        get(){return this.mainSource.conformFrameRate||this.nativeFps;},
+        set(value){this.nativeFps=value;}
+    });
     const existing=new FootageItem(); existing.mainSource.file=new File('/movie.mov'); existing.frameRate=12;
     function property(isSpatial=false){
         const keys=[];
@@ -35,7 +41,8 @@ function run(data, options={}) {
         project:{numItems:1,item(){return existing;},items:{
             addFolder(){return new FolderItem();},
             addComp(name,w,h,par,duration,fps){
-                const comp={name,width:w,height:h,pixelAspect:par,duration,frameRate:fps,list:[],comment:'',openInViewer(){}};
+                const comp={name,width:w,height:h,pixelAspect:par,duration,frameRate:fps,
+                    frameDuration:1/fps,list:[],comment:'',openInViewer(){},remove(){this.removed=true;}};
                 comp.layers={add(footage){
                     const p={}, transformProps={};
                     const transform={property(name){
@@ -92,6 +99,115 @@ test('source interpretation changes are layer retiming, not footage conforming',
     assert.equal(l.footage.mainSource.conformFrameRate,0);
     assert.ok(Math.abs((keys[1].v-keys[0].v)/(keys[1].t-keys[0].t)-0.5)<1e-10);
 });
+test('camera-confirmed fractional fps corrects AE rounding to whole fps',()=>{
+    const d=fixture({fps:24000/1001});
+    Object.assign(d.clips[0],{src_fps:d.fps,camera_fps:d.fps,src_field:'Progressive'});
+    const s=run(d,{nativeFps:24}), l=s.comps[0].list[0];
+    assert.equal(l.footage.frameRate,d.fps);
+    assert.equal(l.startTime,-120/d.fps);
+    assert.equal(l.property('ADBE Time Remapping').keys.length,0);
+    assert.deepEqual(s.alerts,[]);
+
+    d.clips[0].camera_fps=24;
+    const deliberate=run(d,{nativeFps:24});
+    assert.equal(deliberate.imports[0].frameRate,24);
+    assert.equal(deliberate.comps[0].list[0].property('ADBE Time Remapping').keys.length,2);
+    assert.equal(deliberate.alerts.length,1);
+    assert.match(deliberate.alerts[0],/素材fps=.*Time Remap/);
+});
+test('video order follows start times from the bottom while overlapping upper tracks stay above',()=>{
+    const video=(name,track,offset,duration,extra={})=>({
+        ...fixture().clips[0],name,track,offset,duration,...extra
+    });
+    const d=fixture({duration:100},[
+        video('bottom',1,10,30),video('last',3,60,10),video('first',1,0,10),
+        video('overlap',2,20,7),video('top',3,23,5),video('after',1,40,5),
+        video('early upper',3,48,10),video('late lower',1,50,8),
+        video('sound',1,0,10,{kind:'audio'})
+    ]);
+    const topFirst=run(d).comps[0].list.slice().reverse();
+    assert.deepEqual(topFirst.map(l=>l.name),[
+        '[V3] last','[V3] early upper','[V1] late lower','[V1] after',
+        '[V3] top','[V2] overlap','[V1] bottom','[V1] first','[A1] sound'
+    ]);
+});
+test('orientation and input scaling both frame their image tightly and leave Inspector rotation outside',()=>{
+    const d=fixture({fps:24});
+    Object.assign(d.clips[0],{src_w:2160,src_h:3840,source_rotation:90,
+        transform:{zoom_x:1.2,zoom_y:0.8,anchor_x:100,anchor_y:50,flip_x:true},
+        transform_keys:{rotation:[[0,0],[1,20]]}});
+    const s=run(d,{width:2160,height:3840});
+    const l=s.comps[0].list[0];
+    const oriented=s.comps[1], scaled=s.comps[2];
+    const inner=oriented.list[0].property('ADBE Transform Group');
+    const fit=scaled.list[0].property('ADBE Transform Group');
+    assert.equal(l.footage,scaled);
+    assert.equal(l.collapseTransformation,true);
+    assert.equal(scaled.list[0].footage,oriented);
+    assert.equal(scaled.list[0].collapseTransformation,true);
+    assert.deepEqual([oriented.width,oriented.height],[3840,2160]);
+    assert.deepEqual([scaled.width,scaled.height],[1920,1080]);
+    assert.equal(scaled.frameRate,s.imports[0].frameRate);
+    assert.equal(scaled.duration,s.imports[0].duration);
+    assert.deepEqual(Array.from(inner.property('ADBE Scale').value),[100,100]);
+    assert.equal(inner.property('ADBE Rotate Z').value,90);
+    assert.deepEqual(Array.from(fit.property('ADBE Scale').value),[50,50]);
+    assert.equal(fit.property('ADBE Rotate Z').value,0);
+    const t=l.property('ADBE Transform Group');
+    assert.deepEqual(Array.from(t.property('ADBE Scale').value),[-120,80]);
+    assert.deepEqual(Array.from(t.property('ADBE Anchor Point').value),[1060,490]);
+    assert.deepEqual(t.property('ADBE Rotate Z').keys.map(k=>k.v),[0,20]);
+
+    d.input_scaling='stretch';
+    d.height=960;
+    d.clips[0].source_rotation=-90;
+    d.clips[0].transform={};
+    const stretched=run(d,{width:2160,height:3840}).comps[2];
+    assert.deepEqual([stretched.width,stretched.height],[1920,960]);
+    assert.deepEqual(Array.from(stretched.list[0].property('ADBE Transform Group').property('ADBE Scale').value),
+        [50,960/2160*100]);
+
+    d.input_scaling='none';
+    const rotationOnly=run(d,{width:2160,height:3840});
+    assert.equal(rotationOnly.comps.length,2);
+    assert.equal(rotationOnly.comps[1].list[0].property('ADBE Transform Group').property('ADBE Rotate Z').value,-90);
+});
+test('input scaling precomp stops inside fractional Fit bounds and leaves its exact scale',()=>{
+    const s=run(fixture(),{width:2160,height:3840});
+    const scaled=s.comps[1], fit=scaled.list[0].property('ADBE Transform Group');
+    assert.deepEqual([scaled.width,scaled.height],[607,1080]);
+    assert.deepEqual(Array.from(fit.property('ADBE Scale').value),[28.125,28.125]);
+});
+test('precomp reuse preserves separate audio, trim, and retime',()=>{
+    const d=fixture({fps:24,duration:80});
+    Object.assign(d.clips[0],{src_fps:24,duration:20,source_in:10});
+    d.clips.push({...d.clips[0],offset:30,speed:2});
+    d.clips.push({...d.clips[0],offset:10,kind:'audio',mute_audio:false});
+    const s=run(d,{nativeFps:24,width:1280,height:720});
+    const [audio,first,second]=s.comps[0].list, precomp=s.comps[1];
+    assert.equal(s.comps.length,2);
+    assert.equal(audio.footage,s.imports[0]);
+    assert.equal(first.footage,precomp);
+    assert.equal(second.footage,precomp);
+    assert.equal(first.audioEnabled,false);
+    assert.equal(first.startTime,-10/24);
+    assert.equal(second.inPoint,30/24);
+    assert.equal(second.outPoint,50/24);
+    const keys=second.property('ADBE Time Remapping').keys;
+    assert.ok(Math.abs((keys[1].v-keys[0].v)/(keys[1].t-keys[0].t)-2)<1e-10);
+    assert.deepEqual(Array.from(precomp.list[0].property('ADBE Transform Group').property('ADBE Scale').value),
+        [150,150]);
+});
+test('still source precomp spans the edit even when source IN exceeds the importer duration',()=>{
+    const d=fixture({fps:24,duration:80});
+    Object.assign(d.clips[0],{source_in:72,src_fps:24,duration:48});
+    const s=run(d,{still:true,width:1280,height:720,sourceDuration:1});
+    const precomp=s.comps[1], layer=s.comps[0].list[0];
+    assert.equal(precomp.duration,5);
+    assert.equal(precomp.list[0].outPoint,5);
+    assert.equal(layer.startTime,-3);
+    assert.equal(layer.outPoint,2);
+});
 test('retime key clipping preserves slope and layer duration',()=>{
     const d=fixture();d.clips[0].speed=-1;d.clips[0].source_in=29;d.clips[0].src_fps=30000/1001;
     const c=run(d,{nativeFps:30000/1001}).comps[0],l=c.list[0],keys=l.property('ADBE Time Remapping').keys;
@@ -108,7 +224,8 @@ test('per-transfer cache avoids existing manually interpreted footage',()=>{
 });
 test('field variants of the same file are imported independently',()=>{
     const d=fixture();d.clips.push({...d.clips[0],src_field:'Lower Field First'});
-    const s=run(d);assert.equal(s.imports.length,2);assert.equal(s.imports[1].mainSource.fieldSeparationType,2);
+    const s=run(d);assert.equal(s.imports.length,2);
+    assert.deepEqual(s.imports.map(item=>item.mainSource.fieldSeparationType).sort(),[1,2]);
 });
 test('sequence uses Resolve source fps only',()=>{
     const d=fixture();d.clips[0].is_sequence=true;d.clips[0].src_fps=25;
@@ -128,10 +245,10 @@ test('audio-only retime uses stretch',()=>{
 test('nondefault Resolve scale position anchor and rotation are applied through Transform',()=>{
     const d=fixture();Object.assign(d.clips[0],{src_w:3840,src_h:2160,
         transform:{zoom_x:0.32,zoom_y:0.32,pan:0,tilt:0,anchor_x:-950,anchor_y:478,rotation:35.73,opacity:70}});
-    const l=run(d).comps[0].list[0],t=l.property('ADBE Transform Group');
-    assert.deepEqual(Array.from(t.property('ADBE Scale').value),[16,16]);
+    const l=run(d,{width:3840,height:2160}).comps[0].list[0],t=l.property('ADBE Transform Group');
+    assert.deepEqual(Array.from(t.property('ADBE Scale').value),[32,32]);
     assert.deepEqual(Array.from(t.property('ADBE Position').value),[10,62]);
-    assert.deepEqual(Array.from(t.property('ADBE Anchor Point').value),[20,124]);
+    assert.deepEqual(Array.from(t.property('ADBE Anchor Point').value),[10,62]);
     assert.equal(t.property('ADBE Rotate Z').value,35.73);
     assert.equal(t.property('ADBE Opacity').value,70);
 });

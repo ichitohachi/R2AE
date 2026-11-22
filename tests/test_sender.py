@@ -12,12 +12,14 @@ SOURCE = (Path(__file__).resolve().parents[1] / 'r2ae.lua').read_text()
 class SenderTests(unittest.TestCase):
     def run_sender(self, fps='29.97 DF', start=107892, span=(120000,120050),
                    srcfps='59.94', interlace='0', reverse=False, audio=True,
-                   overrides='', source=SOURCE, drop=None, selection=None, fcpxml=None):
+                   overrides='', source=SOURCE, drop=None, selection=None, fcpxml=None,
+                   camera_fps=None):
         lua = LuaRuntime(unpack_returned_tuples=True)
         lua.globals().FPS = fps
         lua.globals().START = start
         lua.globals().FIRST, lua.globals().LAST = span
         lua.globals().SRCFPS = srcfps
+        lua.globals().CAMERAFPS = camera_fps
         lua.globals().INTERLACE = interlace
         lua.globals().DROP = drop
         lua.globals().REVERSE = reverse
@@ -50,6 +52,7 @@ class SenderTests(unittest.TestCase):
             timelinePixelAspectRatio="Square",timelineDropFrameTimecode=DROP,
             timelineInputResMismatchBehavior="scaleToCrop"}
         local props = {["File Path"]="/mock/test.mov",["FPS"]=SRCFPS,
+            ["Camera FPS"]=CAMERAFPS,
             ["Frames"]="1000",["Resolution"]="1920x1080",
             ["Start TC"]="01:00:00;00",["Field Dominance"]="Upper Field First"}
         local mpi = {GetClipProperty=function() return props end}
@@ -146,6 +149,13 @@ class SenderTests(unittest.TestCase):
         self.assertEqual(d['clips'][1]['source_in'], 100)
         self.assertFalse(d['clips'][1]['mute_audio'])
         self.assertTrue(d['clips'][2]['mute_audio'])
+
+    def test_camera_fps_and_explicit_source_rotation(self):
+        source = SOURCE.replace('-- ["/path/to/clip.mov"] = 90,', '["/mock/test.mov"] = -90,')
+        d = self.run_sender(srcfps='23.976', camera_fps='23.98', source=source)
+        self.assertAlmostEqual(d['clips'][0]['camera_fps'], 24000 / 1001)
+        self.assertEqual(d['clips'][0]['source_rotation'], -90)
+        self.assertNotIn('source_rotation', self.run_sender()['clips'][0])
 
     def test_selection_audio_only(self):
         d = self.run_sender(selection='audio')

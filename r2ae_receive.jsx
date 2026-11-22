@@ -96,8 +96,19 @@
 
     // この転送内だけで再利用。既存コンプの手動解釈/プロキシに影響されない。
     var imported = {};
+    var sourcePrecomps = {};
+    var sourcePrecompFolder = null;
+    function cameraRateCorrection(c) {
+        if (c.is_sequence || !(c.camera_fps > 0) || !(c.src_fps > 0)) return 0;
+        var whole = Math.round(c.src_fps);
+        // カメラの公称値とResolveの素材fpsが一致する1000/1001系だけを補正対象にする。
+        if (whole >= 24 && Math.abs(c.src_fps - whole * 1000 / 1001) < 0.0001
+            && Math.abs(c.camera_fps - c.src_fps) < 0.0001) return whole;
+        return 0;
+    }
     function footageKey(path, c) {
-        return path + "|" + (c.is_sequence ? c.src_fps : "movie") + "|" + c.src_field;
+        var rate = c.is_sequence || cameraRateCorrection(c) ? c.src_fps : "auto";
+        return path + "|" + !!c.is_sequence + "|" + rate + "|" + c.src_field;
     }
     function fieldMode(value) {
         var v = String(value || "").toLowerCase();
@@ -115,9 +126,45 @@
         return app.project.items.addFolder(name);
     }
 
-    // Resolveの入力スケーリング係数を求める
-    // Resolveは素材をタイムライン解像度に合わせてから Zoom を掛けるため、
-    // AE側では fit * Zoom を Scale% として与える
+    function layerImportOrder(clips) {
+        var audio = [];
+        var video = [];
+        for (var i = 0; i < clips.length; i++) {
+            if (clips[i].kind === "audio") audio.push(clips[i]);
+            else video.push({ clip: clips[i], index: i, blocked: 0, above: [] });
+        }
+        video.sort(function (a, b) {
+            return a.clip.offset - b.clip.offset || a.clip.track - b.clip.track || a.index - b.index;
+        });
+        for (var first = 0; first < video.length; first++) {
+            var a = video[first];
+            for (var next = first + 1; next < video.length; next++) {
+                var b = video[next];
+                if (b.clip.offset >= a.clip.offset + a.clip.duration) break;
+                var trackDifference = a.clip.track - b.clip.track;
+                if (!(b.clip.duration > 0) || !trackDifference) continue;
+                var upper = trackDifference > 0 ? a : b;
+                var lower = upper === a ? b : a;
+                lower.above.push(upper);
+                upper.blocked++;
+            }
+        }
+        // layers.add()は先頭に追加する。重なる映像は下位トラックを先に追加する。
+        var bottomFirst = [];
+        while (bottomFirst.length < video.length) {
+            for (var n = 0; n < video.length; n++) {
+                var ready = video[n];
+                if (ready.blocked !== 0) continue;
+                bottomFirst.push(ready.clip);
+                ready.blocked = -1;
+                for (var j = 0; j < ready.above.length; j++) ready.above[j].blocked--;
+                break;
+            }
+        }
+        return audio.concat(bottomFirst);
+    }
+
+    // クリップ属性を反映した素材寸法から、タイムラインへの入力スケーリングを求める。
     function getFitFactor(mode, srcW, srcH, compW, compH) {
         if (!srcW || !srcH) return { x: 1, y: 1 };
         var rx = compW / srcW;
@@ -134,6 +181,86 @@
             default:
                 var g = Math.min(rx, ry);
                 return { x: g, y: g };
+        }
+    }
+
+    function sourceGeometry(c, d, footage) {
+        var rotation = c.source_rotation || 0;
+        var quarterTurn = rotation === 90 || rotation === -90;
+        var width = footage.width || c.src_w;
+        var height = footage.height || c.src_h;
+        var orientedWidth = quarterTurn ? height : width;
+        var orientedHeight = quarterTurn ? width : height;
+        return {
+            width: width, height: height, rotation: rotation, quarterTurn: quarterTurn,
+            orientedWidth: orientedWidth, orientedHeight: orientedHeight,
+            fit: getFitFactor(d.input_scaling, orientedWidth, orientedHeight, d.width, d.height)
+        };
+    }
+
+    function getSourcePrecomp(footage, c, d, geometry, notices) {
+        var fit = geometry.fit;
+        var needsScaling = fit.x !== 1 || fit.y !== 1;
+        if (!geometry.rotation && !needsScaling) return null;
+        if ((footage.pixelAspect || 1) !== 1 || (d.pixel_aspect || 1) !== 1) {
+            notices.push(c.name + ": 非正方形ピクセルのため、入力スケーリングはメインのTransformで再現");
+            return null;
+        }
+
+        var still = footage.mainSource.isStill;
+        var sourceFps = still ? d.fps : footage.frameRate;
+        var duration = still
+            ? Math.max(d.duration / d.fps, c.source_in / (c.src_fps || d.fps) + c.duration / d.fps)
+            : footage.duration;
+        var key = [footage.id, geometry.rotation, fit.x, fit.y, duration].join("|");
+        if (sourcePrecomps[key]) return sourcePrecomps[key];
+
+        function addStage(source, suffix, width, height, scale, rotation, collapse) {
+            var stage = app.project.items.addComp(footage.name + suffix, width, height, 1, duration, sourceFps);
+            try {
+                if (stage.duration + stage.frameDuration / 2 < duration) {
+                    throw new Error("AEのコンポの尺の上限を超えています");
+                }
+                stage.preserveNestedFrameRate = !still;
+                var mediaLayer = stage.layers.add(source);
+                mediaLayer.startTime = 0;
+                mediaLayer.inPoint = 0;
+                mediaLayer.outPoint = Math.min(stage.duration, duration);
+                if (collapse) mediaLayer.collapseTransformation = true;
+                var group = mediaLayer.property("ADBE Transform Group");
+                group.property("ADBE Anchor Point").setValue([source.width / 2, source.height / 2]);
+                group.property("ADBE Position").setValue([stage.width / 2, stage.height / 2]);
+                group.property("ADBE Scale").setValue(scale);
+                group.property("ADBE Rotate Z").setValue(rotation);
+                stage.parentFolder = sourcePrecompFolder;
+                return stage;
+            } catch (e) {
+                stage.remove();
+                throw e;
+            }
+        }
+
+        var oriented = null;
+        try {
+            if (!sourcePrecompFolder) sourcePrecompFolder = getOrCreateFolder("Resolve Source Precomps");
+            if (geometry.rotation) {
+                oriented = addStage(footage, " - Orientation", geometry.orientedWidth,
+                    geometry.orientedHeight, [100, 100], geometry.rotation, false);
+            }
+            var precomp = oriented;
+            if (needsScaling) {
+                // ピクセルの端数は内側へ丸め、コラップスで元の倍率と枠外の画素を保つ。
+                var width = Math.floor(geometry.orientedWidth * fit.x + 1e-7);
+                var height = Math.floor(geometry.orientedHeight * fit.y + 1e-7);
+                precomp = addStage(oriented || footage, " - Input Scaling", width, height,
+                    [fit.x * 100, fit.y * 100], 0, !!oriented);
+            }
+            sourcePrecomps[key] = precomp;
+            return precomp;
+        } catch (e) {
+            if (oriented) oriented.remove();
+            notices.push(c.name + ": 素材プリコンを作成できないため、メインのTransformで再現: " + e.toString());
+            return null;
         }
     }
 
@@ -159,9 +286,10 @@
         return values;
     }
 
-    function applyTransform(layer, c, d, footage, notices) {
+    function applyTransform(layer, c, d, geometry, precomp, notices) {
         var t = c.transform;
-        if (!t) return;
+        var orientation = precomp ? 0 : geometry.rotation;
+        var quarterTurn = !precomp && geometry.quarterTurn;
         // Match names must be resolved from their immediate parent group.
         var group = layer.property("ADBE Transform Group");
         if (!group) throw new Error("Transformグループを取得できません");
@@ -217,15 +345,17 @@
 
         var compW = d.width || 1920;
         var compH = d.height || 1080;
-        var srcW = c.src_w || footage.width;
-        var srcH = c.src_h || footage.height;
-        var fit = getFitFactor(d.input_scaling, srcW, srcH, compW, compH);
+        var srcW = precomp ? precomp.width : geometry.width;
+        var srcH = precomp ? precomp.height : geometry.height;
+        var fit = precomp ? { x: 1, y: 1 } : geometry.fit;
         var signX = (t.flip_x === true || t.flip_x === 1) ? -1 : 1;
         var signY = (t.flip_y === true || t.flip_y === 1) ? -1 : 1;
 
         setTransform("ADBE Scale", [animation.scale], function (time) {
             var zoom = sampleKeys(animation.scale, time, [t.zoom_x == null ? 1 : t.zoom_x, t.zoom_y == null ? 1 : t.zoom_y]);
-            return [fit.x * zoom[0] * 100 * signX, fit.y * zoom[1] * 100 * signY];
+            var x = fit.x * zoom[0] * 100 * signX;
+            var y = fit.y * zoom[1] * 100 * signY;
+            return quarterTurn ? [y, x] : [x, y];
         });
 
         // Resolveのアンカーはピボット。AEではアンカーと表示位置の両方へ反映する。
@@ -233,8 +363,13 @@
         var basePosition = [t.pan || 0, t.tilt || 0];
         setTransform("ADBE Anchor Point", [animation.anchor], function (time) {
             var anchor = sampleKeys(animation.anchor, time, baseAnchor);
-            return [srcW / 2 + (fit.x !== 0 ? anchor[0] / fit.x : 0),
-                    srcH / 2 - (fit.y !== 0 ? anchor[1] / fit.y : 0)];
+            var x = fit.x !== 0 ? anchor[0] / fit.x : 0;
+            var y = fit.y !== 0 ? -anchor[1] / fit.y : 0;
+            // ピボットのオフセットを回転前の素材座標に戻す。
+            if (orientation === 90) return [srcW / 2 + y, srcH / 2 - x];
+            if (orientation === -90) return [srcW / 2 - y, srcH / 2 + x];
+            if (orientation === 180) return [srcW / 2 - x, srcH / 2 - y];
+            return [srcW / 2 + x, srcH / 2 + y];
         });
         setTransform("ADBE Position", [animation.position, animation.anchor], function (time) {
             var position = sampleKeys(animation.position, time, basePosition);
@@ -242,7 +377,7 @@
             return [compW / 2 + position[0] + anchor[0], compH / 2 - position[1] - anchor[1]];
         });
         setTransform("ADBE Rotate Z", [animation.rotation], function (time) {
-            return sampleKeys(animation.rotation, time, [t.rotation || 0])[0];
+            return orientation + sampleKeys(animation.rotation, time, [t.rotation || 0])[0];
         });
         if (animation.amount || (t.opacity != null && t.opacity !== 100)) {
             setTransform("ADBE Opacity", [animation.amount], function (time) {
@@ -260,7 +395,7 @@
         // source_in は素材フレーム基準。動画はAEの読み込みfpsで秒へ換算し、
         // Resolveの素材解釈fpsとの差をレイヤー速度で再現する。
         var srcFps = (c.src_fps && c.src_fps > 0) ? c.src_fps : fps;
-        // 動画は元のfpsのまま取り込む。Resolveの素材解釈変更はレイヤー速度で表す。
+        // Resolve側で素材解釈が変更された場合はレイヤー速度で表す。
         var nativeFps = footage.hasVideo && !footage.mainSource.isStill ? footage.frameRate : srcFps;
         if (!(c.src_fps > 0)) srcFps = nativeFps;
         var inSec = c.source_in / nativeFps;
@@ -344,7 +479,7 @@
             layer.inPoint = t1;
             layer.outPoint = offsetSec + durSec;
 
-            return "速度 " + Math.round(speed * 1000) / 10 + "%"
+            return "Time Remap " + Math.round(speed * 1000) / 10 + "%"
                 + (clamped ? "(素材尺で丸め)" : "");
         } catch (e) {
             // 失敗を呼び出し元に返し、不完全なレイヤーを除去する
@@ -396,11 +531,9 @@
             + (d.display_start_frame != null ? " / Resolve開始フレーム=" + d.display_start_frame
                  : " / Resolve開始秒=" + d.display_start_time);
 
-        // JSONは下のレイヤーから順に並んでいる（audio -> V1 -> V2...）
-        // layers.add() は常に最前面に追加されるため、この順で追加すれば
-        // 最終的にVの上位トラックが一番上に来る
-        for (var i = 0; i < d.clips.length; i++) {
-            var c = d.clips[i];
+        var clips = layerImportOrder(d.clips);
+        for (var i = 0; i < clips.length; i++) {
+            var c = clips[i];
             var src = new File(c.path);
 
             if (!src.exists) {
@@ -450,27 +583,40 @@
                         var mode = fieldMode(c.src_field);
                         if (mode != null) footage.mainSource.fieldSeparationType = mode;
                         else notices.push(c.name + ": 素材フィールド順不明。AEの自動解釈を使用（要確認）");
+                        var roundedRate = cameraRateCorrection(c);
+                        if (roundedRate && Math.abs(footage.frameRate - roundedRate) < 0.0001) {
+                            try {
+                                footage.mainSource.conformFrameRate = c.src_fps;
+                            } catch (eRate) {
+                                notices.push(c.name + ": 素材fpsの設定に失敗: " + eRate.toString());
+                            }
+                        }
                     }
                     footage.comment = "Resolve FPS=" + c.src_fps_raw + " / Start TC=" + c.src_start_tc
                         + " / Field=" + c.src_field;
                     imported[cacheKey] = footage;
                 }
 
-                layer = comp.layers.add(footage);
+                var geometry = c.kind !== "audio" && c.transform && footage.hasVideo
+                    ? sourceGeometry(c, d, footage) : null;
+                var precomp = geometry ? getSourcePrecomp(footage, c, d, geometry, notices) : null;
+                layer = comp.layers.add(precomp || footage);
+                // 拡大時に元の画素を使い、プリコン枠を超えた素材もメインコンプで扱う。
+                if (precomp) layer.collapseTransformation = true;
 
                 if (footage.hasVideo && !footage.mainSource.isStill && c.src_fps > 0
                     && Math.abs(c.src_fps - footage.frameRate) > 0.01) {
                     notices.push(c.name + ": Resolveの素材解釈fps=" + c.src_fps
-                        + " / AEの素材fps=" + footage.frameRate + "。差はレイヤー速度に反映（要確認）");
+                        + " / AEの素材fps=" + footage.frameRate + "。差はTime Remapに反映（要確認）");
                 }
                 var status = placeLayer(layer, c, fps, footage);
                 if (status.indexOf("失敗") >= 0) {
                     failed.push(c.name + " " + status);
-                } else if (status !== "等速") {
+                } else if (status !== "等速" && c.speed != null && c.speed !== 1) {
                     retimed.push(c.name + " -> " + status);
                 }
 
-                applyTransform(layer, c, d, footage, notices);
+                if (geometry) applyTransform(layer, c, d, geometry, precomp, notices);
 
                 // Aトラック側を独立レイヤーにした場合、映像側の音声はオフにする
                 if (c.mute_audio === true && layer.hasAudio) {
