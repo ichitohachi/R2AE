@@ -89,11 +89,11 @@ If Windows automation fails, open `r2ae_receive.jsx` via File > Scripts > Run Sc
 
 For IDT transfer, copy the repository's `color` folder next to the installed receiver. Use After Effects 26.5 or later with its built-in **ACES 2.0 Studio v4.0** configuration and **ACES/ACEScg** as Working Color Space.
 
-On macOS, sending from ACEScct 2.0 while AE is closed launches AE and imports into a new project based on `color/r2ae-aces-project.aet`. This template uses 32 bpc, ACES/ACEScg, and `sRGB - Display / ACES 2.0 - SDR 100 nits (Rec.709)`. Transfers to an already running AE use its current project. Set the render output transform in AE.
+On macOS, sending from ACEScct 2.0 while AE is closed launches AE and imports into a new 32 bpc project with **ACES/ACEScg** as Working Color Space. R2AE sets the project's **Display Color Space** to a verified equivalent of the Resolve ODT. Unmapped values use `sRGB - Display / ACES 2.0 - SDR 100 nits (Rec.709)`. Transfers to an already running AE use its current project color settings.
 
 If Resolve does not report its ACES version, R2AE defaults to ACES 2.0 for ACEScct cold starts. Set `ASSUME_ACES_2_ON_COLD_START` to `false` if you also work in ACES 1.x.
 
-R2AE reads the Resolve clip or project IDT in an ACES 2.0 project (ACEScc or ACEScct). Supported transforms include Sony, ARRI, Blackmagic, Canon, RED, ACEScg, ACES2065-1, and verified inverse display transforms for Rec.709 and sRGB. See the [Resolve–AE IDT table (Japanese)](docs/IDT.ja.md) for exact names. The input override is saved with each footage item in **Interpret Footage > Color**. The bundled AE project and reference clip supply the input presets during transfer. Saved projects link directly to the original media.
+R2AE reads the Resolve clip or project IDT in an ACES 2.0 project (ACEScc or ACEScct). Supported transforms include Sony, ARRI, Blackmagic, Canon, RED, ACEScct, ACEScg, ACES2065-1, and verified inverse display transforms for Rec.709 and sRGB. See the [Resolve–AE color transform table (Japanese)](docs/IDT.ja.md) for exact names. The input override is saved with each footage item in **Interpret Footage > Color**. The bundled AE project and reference clip supply the input presets during transfer. Saved projects link directly to the original media.
 
 R2AE records the Resolve ODT in the comp comment for reference. If a preset would change source attributes such as pixel aspect, R2AE keeps the source's native interpretation and reports the clip for manual IDT assignment. Unsupported inputs are also reported.
 
@@ -106,6 +106,7 @@ Behavior can be changed via variables at the top of `r2ae.lua`.
 | `AUDIO_MODE` | `"auto"` (default; merges matching A/V items) / `"separate"` (independent audio layers) |
 | `INPUT_SCALING` | `"auto"` (default; uses the timeline's input sizing setting) / `"fit"` / `"fill"` / `"stretch"` / `"none"` |
 | `ROTATION_SIGN` | `1` / `-1` (default) — corrects rotation direction |
+| `SOURCE_ROTATION_BY_PATH` | Optional override of automatic source orientation. Map an absolute path to a clockwise adjustment of `90`, `-90`, `180`, or `0` degrees from AE's imported orientation. |
 | `ENABLE_SPEED` | `true` (default) — whether speed changes are reflected as Time Remap |
 | `ENABLE_TRANSFORM_KEYFRAMES` | `true` (default) — transfer Edit page transform keys on macOS |
 | `RESPECT_TRACK_ENABLE` | `true` (default) — exclude disabled tracks |
@@ -128,9 +129,11 @@ On macOS, R2AE extracts keys for the selected clips from a temporary Resolve FCP
 
 ## Timing and interpretation in this revision
 
-Image sequences use their Resolve source fps. For movies, when Resolve's clip fps matches the camera's fractional 1000/1001 rate and AE imports at the corresponding whole fps, R2AE sets the footage interpretation to the camera rate. Other interpretation differences use Time Remap. DF is timecode numbering, not frame removal. Composition DF is explicitly set; source DF and Resolve-only source timecode overrides are not guaranteed. Source timecode and FPS metadata are recorded in comments.
+Image sequences use their Resolve source fps. For movies, when Resolve's clip fps matches the camera's fractional 1000/1001 rate and AE imports at the corresponding whole fps, R2AE sets the footage interpretation to the camera rate. R2AE uses the clip speed reported by Resolve when available. When Resolve and AE report different source frame counts but agree on the elapsed duration within about one frame, R2AE places the clip by elapsed time. Frame-rate reinterpretation still uses Time Remap. DF is timecode numbering, not frame removal. Composition DF is explicitly set; source DF and Resolve-only source timecode overrides are not guaranteed. Source timecode and FPS metadata are recorded in comments.
 
-Video layers run bottom to top in start-time order where possible. Overlaps retain Resolve's video track priority. For a Clip Attributes Image Orientation override, set `SOURCE_ROTATION_BY_PATH` in `r2ae.lua` to the additional rotation from AE's imported orientation. Orientation precomps use the rotated source resolution. Input Scaling precomps use the scaled image bounds, avoiding transparent padding inside either precomp while preserving existing source alpha. The main composition uses Collapse Transformations and holds the Resolve Inspector transforms. For non-square pixels or when AE cannot build a source precomp, the layer uses a combined Transform.
+Video layers run bottom to top in start-time order where possible. Overlaps retain Resolve's video track priority. R2AE adds the original footage directly to the main composition. The layer Transform combines input scaling and source orientation with the Resolve Inspector transforms.
+
+On macOS with Resolve 21.2, R2AE reads Clip Attributes > Image Orientation from a temporary DRT timeline export. It applies the difference from the source file's embedded orientation. `SOURCE_ROTATION_BY_PATH` is available for manual overrides and other Resolve versions.
 
 Recognized source Field Dominance values set AE field separation. Unknown values retain importer interpretation and produce a notice. Field rendering is an output setting and must be configured separately. The verified setting key is `timelineInterlaceProcessing`. Interlaced API rates >= 49 use field ticks: composition fps and timeline coordinates are divided by two together, preserving elapsed seconds; source trimming still uses the original API clock. Progressive 59.94 fps remains unchanged. The Resolve API values were read live; the updated interlaced composition has not yet been verified live in AE.
 
@@ -138,7 +141,7 @@ In auto mode, matching source, timing, trim and speed allow one A item to enable
 
 ## Known limitations
 
-- The check that distinguishes a frame-rate conform from an actual speed change is heuristic. If you notice a misclassification, please file an issue with the measured values (from the Resolve Console log)
+- When Resolve does not return clip speed, R2AE estimates constant retimes from the source and timeline frame ranges. Variable-speed curves are unsupported.
 - Pitch / Yaw are not supported, since Resolve and After Effects use different projection models and cannot be reconciled accurately
 - Windows automatic execution requires After Effects to already be running. If it isn't, R2AE doesn't launch it automatically — the Console will say so, and the JSON stays written so you can pick it up later (open After Effects, then run the script manually)
 

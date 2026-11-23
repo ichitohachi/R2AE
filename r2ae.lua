@@ -57,9 +57,8 @@ local INPUT_SCALING = "auto"
 -- （実測により既定を -1 にしている）
 local ROTATION_SIGN = -1
 
--- Clip AttributesのImage OrientationはAPIから取得できない。
--- 必要な場合、AEで読み込んだ向きからの追加回転を素材の絶対パスごとに指定。
--- 90 = 時計回り、-90 = 反時計回り、180 = 上下反転。
+-- 自動取得したClip Attributesの向きより優先する、素材ごとの追加回転。
+-- 90 = 時計回り、-90 = 反時計回り、180 = 半回転、0 = 補正なし。
 local SOURCE_ROTATION_BY_PATH = {
     -- ["/path/to/clip.mov"] = 90,
 }
@@ -340,22 +339,8 @@ local function get_transform(item)
 end
 
 -- 定速リタイムの倍率を求める。1.0 = 等速、負値 = 逆再生
--- 素材の消費フレーム数をトリム情報とソースフレーム番号の2通りで求め、
--- 一致した場合のみ採用する（どちらかが信用できない環境があるため）
-local function get_speed(item, props)
-    local dur = item:GetDuration()
-    if not dur or dur <= 0 then return 1, nil end
-
-    -- 方法A: メディア総尺から前後のトリム量を引く
-    local usedA = nil
-    local frames = tonumber(props and props["Frames"])
-    local lo = item:GetLeftOffset()
-    local ro = item:GetRightOffset()
-    if frames and lo and ro then
-        usedA = frames - lo - ro
-    end
-
-    -- 方法B: ソース側の開始/終了フレーム番号の差
+-- Resolveが速度を返さない場合のみ、トリムとソースフレーム範囲から推定する。
+local function get_speed(item, srcFps, frames)
     local usedB, reverse = nil, false
     local ok1, ss = pcall(function() return item:GetSourceStartFrame() end)
     local ok2, se = pcall(function() return item:GetSourceEndFrame() end)
@@ -363,6 +348,19 @@ local function get_speed(item, props)
         usedB = math.abs(se - ss) + 1
         reverse = (se < ss)
     end
+
+    local ok, options = pcall(function() return item:GetSpeed() end)
+    local percentage = ok and type(options) == "table" and tonumber(options.Percentage)
+    if percentage and math.abs(percentage) < math.huge then
+        if reverse then percentage = -math.abs(percentage) end
+        return percentage / 100, nil
+    end
+
+    if not srcFps then return 1, nil end
+    local dur = item:GetDuration()
+    if not dur or dur <= 0 then return 1, nil end
+    local lo, ro = item:GetLeftOffset(), item:GetRightOffset()
+    local usedA = frames and lo and ro and (frames - lo - ro)
 
     -- 両方取れて食い違う場合は判断できないので等速にする
     if usedA and usedB and math.abs(usedA - usedB) > 1 then
@@ -374,16 +372,12 @@ local function get_speed(item, props)
 
     -- 素材fpsとタイムラインfpsが異なる場合、Resolveがコンフォームするため
     -- フレーム数の比だけでは速度と区別がつかない。fps比で割り戻す。
-    local srcFps = parse_fps(props and props["FPS"])
-    local conform = 1
-    if srcFps and srcFps > 0 and fps and fps > 0 then
-        conform = srcFps / fps
-    end
+    local conform = srcFps / fps
 
     local sp = used / (dur * conform)
 
-    -- 誤差程度の差は等速とみなす
-    if math.abs(used - dur * conform) <= 1 then
+    -- 素材またはタイムラインの1フレーム以内は端点の丸めで生じる。
+    if math.abs(used - dur * conform) <= math.max(1, conform) then
         sp = 1
         if not reverse then return 1, nil end
     end
@@ -425,9 +419,17 @@ local function collect_track(trackType, trackIndex)
                             if ok and v then sourceIn = v end
                         end
 
+                        local srcFps = parse_fps(props["FPS"])
+                        local frames = tonumber(props["Frames"])
+                        local sourceInTime = nil
+                        if trackType == "video" and srcFps and frames and not isSequence then
+                            local ok, value = pcall(function() return item:GetSourceStartTime() end)
+                            if ok then sourceInTime = tonumber(value) end
+                        end
+
                         local speed = 1
-                        if ENABLE_SPEED and parse_fps(props["FPS"]) then
-                            local sp, info = get_speed(item, props)
+                        if ENABLE_SPEED then
+                            local sp, info = get_speed(item, srcFps, frames)
                             speed = sp
                             if info then
                                 print(string.format("  [retime] %s : %s",
@@ -435,11 +437,6 @@ local function collect_track(trackType, trackIndex)
                                 warn(item:GetName() .. ": 速度はAPIフレーム範囲からの推定です。" .. info)
                             end
                         end
-
-                        -- 素材fps。source_in は素材フレーム基準の値なので、
-                        -- タイムラインfpsと異なる場合の換算に必要（AE側で使う）
-                        local srcFps = parse_fps(props["FPS"])
-                        if not srcFps or srcFps <= 0 then srcFps = nil end
 
                         -- 素材解像度（スケール計算に使う）
                         local sw, sh = nil, nil
@@ -449,10 +446,17 @@ local function collect_track(trackType, trackIndex)
                             if a then sw, sh = tonumber(a), tonumber(b) end
                         end
 
+                        local mediaID
+                        if trackType == "video" and not IS_WINDOWS and mpi.GetMediaId then
+                            local ok, id = pcall(function() return mpi:GetMediaId() end)
+                            if ok and type(id) == "string" and id ~= "" then mediaID = id end
+                        end
+
                         table.insert(collected, {
                             name = item:GetName(),
                             path = path,
                             kind = trackType,
+                            media_id = mediaID,
                             track = trackIndex,
                             start = s,
                             duration = e - s,
@@ -460,6 +464,8 @@ local function collect_track(trackType, trackIndex)
                             mute_audio = false,
                             speed = speed,
                             src_fps = srcFps,
+                            src_frames = frames,
+                            source_in_time = sourceInTime,
                             camera_fps = not isSequence and parse_fps(props["Camera FPS"]) or nil,
                             src_fps_raw = tostring(props["FPS"] or ""),
                             src_start_tc = tostring(props["Start TC"] or ""),
@@ -746,6 +752,110 @@ end
 
 read_transform_keys(finalList)
 
+-- Resolve 21.2のBtVideoInfo/RadiometryはProtocol Buffersのワイヤー形式。
+-- 19は適用後、27は素材由来の角度。両方とも時計回りを正とするsint32。
+local function read_radiometry_rotation(hex)
+    if not hex or #hex > 131072 or #hex % 2 ~= 0 or hex:find("[^%x]") then return end
+    local bytes = hex:gsub("%x%x", function(pair) return string.char(tonumber(pair, 16)) end)
+    local position = 1
+    local function read_varint()
+        local value, factor = 0, 1
+        for _ = 1, 5 do
+            local byte = bytes:byte(position)
+            if not byte then return end
+            position = position + 1
+            value = value + (byte % 128) * factor
+            if byte < 128 then return value end
+            factor = factor * 128
+        end
+    end
+    local angles = {}
+    while position <= #bytes do
+        local tag = read_varint()
+        if not tag or tag < 8 then return end
+        local field, wire = math.floor(tag / 8), tag % 8
+        if wire == 0 then
+            local value = read_varint()
+            if value == nil then return end
+            if field == 19 or field == 27 then
+                local angle = (value % 2 == 0) and value / 2 or -(value + 1) / 2
+                if angles[field] or math.abs(angle) > 270 or angle % 90 ~= 0 then return end
+                angles[field] = angle
+            end
+        elseif wire == 2 then
+            local length = read_varint()
+            if length == nil then return end
+            position = position + length
+        elseif wire == 1 or wire == 5 then
+            position = position + (wire == 1 and 8 or 4)
+        else
+            return
+        end
+        if position > #bytes + 1 then return end
+    end
+    if angles[19] and angles[27] then
+        local rotation = (angles[19] - angles[27]) % 360
+        return rotation == 270 and -90 or rotation
+    end
+end
+
+local function read_source_rotations(clips)
+    if IS_WINDOWS or not timeline.Export or not resolve.EXPORT_DRT then return end
+
+    local selected = {}
+    for _, c in ipairs(clips) do
+        if c.kind == "video" and c.media_id and SOURCE_ROTATION_BY_PATH[c.path] == nil then
+            selected[c.media_id:lower()] = true
+        end
+    end
+    if not next(selected) then return end
+
+    local archive
+    local ok, rotations = pcall(function()
+        local temporary = os.tmpname()
+        archive = temporary .. ".drt"
+        os.remove(temporary)
+        assert(timeline:Export(archive, resolve.EXPORT_DRT, resolve.EXPORT_NONE), "DRTを書き出せません")
+        local limit = 64 * 1024 * 1024
+        local reader = assert(io.popen("/usr/bin/unzip -p " .. shell_quote(archive)
+            .. " 'MediaPool/*/MpFolder.xml' 2>/dev/null", "r"))
+        local data = reader:read(limit + 1)
+        local closed = reader:close()
+        assert(closed and data and #data <= limit, "DRT内のメディア情報を読み込めません")
+        assert(data:match('DbAppVer="21%.2%.%d+%.%d+"%s+DbPrjVer="17"'),
+            "このResolveバージョンのDRT形式は未検証です")
+
+        local found = {}
+        for clip in data:gmatch("<Sm2MpVideoClip%s[^>]*>(.-)</Sm2MpVideoClip>") do
+            local id = clip:match("<UniqueMediaPoolItemId>([%x%-]+)</UniqueMediaPoolItemId>")
+            id = id and id:lower()
+            if id and selected[id] then
+                local video = clip:match("<Video>%s*<BtVideoInfo[^>]*>(.-)</BtVideoInfo>%s*</Video>")
+                local rotation = read_radiometry_rotation(video and video:match("<Radiometry>%s*(%x+)%s*</Radiometry>"))
+                if found[id] == nil then
+                    found[id] = rotation or false
+                elseif found[id] ~= rotation then
+                    found[id] = false
+                end
+            end
+        end
+        return found
+    end)
+    if archive then os.remove(archive) end
+    if not ok then
+        warn("クリップ属性の回転を自動取得できません。" .. tostring(rotations))
+        return
+    end
+
+    for _, c in ipairs(clips) do
+        if c.kind == "video" and c.media_id then
+            c.source_rotation = rotations[c.media_id:lower()] or nil
+        end
+    end
+end
+
+read_source_rotations(finalList)
+
 -- ---- JSON書き出し --------------------------------------------------------
 
 ensure_dir(BRIDGE_DIR)
@@ -756,13 +866,19 @@ for _, c in ipairs(finalList) do
     if c.src_fps then
         extra = extra .. string.format(', "src_fps": %s', tostring(c.src_fps))
     end
+    if c.src_frames and c.src_frames > 0 and c.src_frames < math.huge then
+        extra = extra .. string.format(', "src_frames": %s', tostring(c.src_frames))
+    end
+    if c.source_in_time and c.source_in_time >= 0 and c.source_in_time < math.huge then
+        extra = extra .. string.format(', "source_in_time": %.10f', c.source_in_time)
+    end
     if c.camera_fps then
         extra = extra .. string.format(', "camera_fps": %s', tostring(c.camera_fps))
     end
     if c.src_idt then
         extra = extra .. string.format(', "src_idt": "%s"', json_escape(c.src_idt))
     end
-    local sourceRotation = c.kind == "video" and SOURCE_ROTATION_BY_PATH[c.path]
+    local sourceRotation = c.kind == "video" and (SOURCE_ROTATION_BY_PATH[c.path] or c.source_rotation)
     if sourceRotation == 90 or sourceRotation == -90 or sourceRotation == 180 then
         extra = extra .. string.format(', "source_rotation": %d', sourceRotation)
     end

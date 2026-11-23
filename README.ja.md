@@ -89,11 +89,11 @@ Windowsで自動実行に失敗した場合は、AEのファイル > スクリ�
 
 リポジトリの `color` フォルダを、インストール先の `r2ae_receive.jsx` と同じ階層にコピーします。AE 26.5以降で、標準の **ACES 2.0 Studio v4.0** と Working Color Space の **ACES/ACEScg** を使用します。
 
-macOSでResolveのACEScct 2.0からAEが未起動の状態で送ると、R2AEが `color/r2ae-aces-project.aet` を開き、新規AEプロジェクトに取り込みます。テンプレートは32 bpc、ACES/ACEScg、`sRGB - Display / ACES 2.0 - SDR 100 nits (Rec.709)` です。AEが起動中の場合は現在のプロジェクトに取り込みます。書き出しのODTはAEで設定します。
+macOSでResolveのACEScct 2.0からAEが未起動の状態で送ると、R2AEが32 bpc、Working Color Spaceが **ACES/ACEScg** の新規AEプロジェクトに取り込みます。**Display Color Space** にはResolveのODTに対応する設定を使います。対応先がない場合は `sRGB - Display / ACES 2.0 - SDR 100 nits (Rec.709)` になります。AEが起動中の場合は現在のプロジェクトのカラー設定を使います。
 
 ResolveのAPIがACESバージョンを返さない場合、ACEScctのコールド起動は既定でACES 2.0として扱います。ACES 1.xと併用する場合は `ASSUME_ACES_2_ON_COLD_START` を `false` にできます。
 
-ResolveのACES 2.0（ACESccまたはACEScct）から、クリップまたはプロジェクト既定のIDTを取得します。Sony、ARRI、Blackmagic、Canon、RED、ACEScg／ACES2065-1、および検証済みのRec.709／sRGB逆変換に対応します。正確な項目名は[ResolveとAEのIDT対応表](docs/IDT.ja.md)を参照してください。入力色空間は素材ごとに **フッテージを変換 > カラー** に保存されます。同梱のAEプロジェクトと参照クリップは転送時のプリセットに使用し、保存後のAEプロジェクトは元の素材を参照します。
+ResolveのACES 2.0（ACESccまたはACEScct）から、クリップまたはプロジェクト既定のIDTを取得します。Sony、ARRI、Blackmagic、Canon、RED、ACEScct／ACEScg／ACES2065-1、および検証済みのRec.709／sRGB逆変換に対応します。正確な項目名は[ResolveとAEの色変換対応表](docs/IDT.ja.md)を参照してください。入力色空間は素材ごとに **フッテージを変換 > カラー** に保存されます。同梱のAEプロジェクトと参照クリップは転送時のプリセットに使用し、保存後のAEプロジェクトは元の素材を参照します。
 
 ResolveのODTはコンポのコメントに記録します。プリセット適用時にピクセル縦横比などの素材属性を維持できない場合は、素材の元の解釈を保持し、IDTの手動設定が必要な項目として通知します。未対応のIDTも通知の対象です。
 
@@ -108,7 +108,7 @@ ResolveのODTはコンポのコメントに記録します。プリセット適�
 | `TIMELINE_FRAME_RATE_OVERRIDE` | 既定は `nil`。インターレースのAPI座標を実測した場合のみ、フレーム数/秒を指定 |
 | `INPUT_SCALING` | `"auto"`（既定。タイムラインの「解像度が一致しないファイル」設定を使用）/ `"fit"` / `"fill"` / `"stretch"` / `"none"` |
 | `ROTATION_SIGN` | `1` / `-1`（既定）— 回転方向の補正 |
-| `SOURCE_ROTATION_BY_PATH` | 既定は空。AEで読み込んだ向きから追加で回す素材を、絶対パスと角度（時計回り `90`、反時計回り `-90`、半回転 `180`）で指定 |
+| `SOURCE_ROTATION_BY_PATH` | 既定は空。絶対パスと追加回転角（時計回り `90`、反時計回り `-90`、半回転 `180`、補正なし `0`）を指定すると自動補正より優先 |
 | `ENABLE_SPEED` | `true`（既定）— 速度変更をタイムリマップに反映するか |
 | `ENABLE_TRANSFORM_KEYFRAMES` | `true`（既定）— macOSで編集ページのTransformキーフレームを転送するか |
 | `RESPECT_TRACK_ENABLE` | `true`（既定）— 無効化したトラックを除外するか |
@@ -129,13 +129,15 @@ Resolve のインスペクタ値（Zoom / Pan / Tilt / Anchor Point / Rotation�
 
 映像レイヤーは開始が早いものからAEの下から上へ並びます。時間が重なる区間はResolveの上位映像トラックをAEでも上に置きます。
 
-Resolveのクリップ属性にある「Image Orientation」は自動取得できません。必要な素材は `SOURCE_ROTATION_BY_PATH` で追加回転角を指定できます。向き補正のプリコンは回転後の素材解像度、入力スケーリングのプリコンは拡縮後の画像範囲に合わせて作ります。どちらも必要な場合は、この順でネストします。プリコン内にスケーリングによる透明な余白は追加せず、素材が持つアルファは維持します。メインコンプではコラップストランスフォームを有効にし、Resolveのインスペクタで設定した変形を反映します。非正方形ピクセルの素材・タイムラインと、AEが素材プリコンを作成できない場合は、メインのTransformで合成します。
+元のフッテージをメインコンプのレイヤーに直接配置します。入力スケーリングと向き補正を、Resolveのインスペクタの変形と合わせてレイヤーのTransformに反映します。
+
+macOSのResolve 21.2では、タイムラインの一時DRT書き出しからクリップ属性の「Image Orientation」を読み取り、素材に埋め込まれた向きとの差だけを適用します。手動で上書きする場合や、他のバージョンで回転補正が必要な場合は `SOURCE_ROTATION_BY_PATH` を使えます。
 
 macOSでは、Resolveが書き出した一時FCPXMLから選択クリップのキーフレームを抽出します。AEでの補間は直線です。FCPXMLに含まれるキーはトリムの前後も元の相対時刻に配置し、レイヤーの表示範囲はResolveのトリムに合わせます。同じ素材が同じ位置・尺で重なって区別できない場合や、FCPXMLでリタイムが付いているクリップは静的なTransformで送ります。
 
 ## fps・DF・インターレース
 
-動画は素材のfpsを維持します。Resolveの素材fpsとカメラfpsが同じ1000/1001系で、AEが整数fpsとして読み込んだ場合は、素材解釈をカメラfpsに合わせます。画像連番にはResolveの素材fpsを設定します。それ以外でResolveとAEの素材fpsが異なる場合は、Time Remapで差を補正します。
+動画は素材のfpsを維持します。Resolveの素材fpsとカメラfpsが同じ1000/1001系で、AEが整数fpsとして読み込んだ場合は、素材解釈をカメラfpsに合わせます。画像連番にはResolveの素材fpsを設定します。Resolveがクリップ速度を返す場合はその値を優先します。可変フレームレート素材などでResolveとAEが異なるフレーム数を報告しても、実時間の尺が約1フレーム以内で一致する場合は秒基準で配置します。素材解釈fpsそのものが異なる場合は、Time Remapで差を補正します。
 
 DFはタイムコードの番号付けであり、フレームの削除や速度変更ではありません。コンポのDF/NDFは明示設定します。元動画は再エンコード・変更せず読み込み、素材のタイムコードはAEのインポータに委ねます。Resolveの素材Start TC/FPS文字列はコメントへ記録しますが、素材DF表示やResolveで変更したStart TCの完全な再設定を保証しません。
 
@@ -145,7 +147,7 @@ DFはタイムコードの番号付けであり、フレームの削除や速度
 
 ## 既知の制約
 
-- 素材 fps とタイムライン fps が異なる場合のコンフォームと、実際の速度変更の判定はヒューリスティックです。誤判定に気づいた場合は Issue で実測値（Resolve Console のログ）を添えて報告してください
+- ResolveのAPIが速度を返さない場合は、素材とタイムラインのフレーム範囲から定速リタイムを推定します。可変速カーブの転送には対応していません
 - ピッチ / ヨーは Resolve と After Effects で投影モデルが異なるため、正確な再現ができず非対応としています
 - 音量・パン・モノ/ステレオのチャンネル割当・Fairlight FX・ピッチ維持・サンプル単位の音声IN点は保証しません。L/R分割素材はAEで確認してください
 - 非正方形ピクセルを含むTransform、カラー管理、Optical Flow等のフレーム補間、フリーズ/可変速、VFR動画の完全一致は保証しません

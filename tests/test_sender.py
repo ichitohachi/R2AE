@@ -13,12 +13,15 @@ class SenderTests(unittest.TestCase):
     def run_sender(self, fps='29.97 DF', start=107892, span=(120000,120050),
                    srcfps='59.94', interlace='0', reverse=False, audio=True,
                    overrides='', source=SOURCE, drop=None, selection=None, fcpxml=None,
-                   camera_fps=None, color_science=None, clip_idt=None, project_idt=None):
+                   camera_fps=None, color_science=None, clip_idt=None, project_idt=None,
+                   speed_percentage=None, source_in_time=None, drt_pool=None):
         lua = LuaRuntime(unpack_returned_tuples=True)
         lua.globals().FPS = fps
         lua.globals().START = start
         lua.globals().FIRST, lua.globals().LAST = span
         lua.globals().SRCFPS = srcfps
+        lua.globals().SPEED_PERCENTAGE = speed_percentage
+        lua.globals().SOURCE_IN_TIME = source_in_time
         lua.globals().CAMERAFPS = camera_fps
         lua.globals().COLOR_SCIENCE = color_science
         lua.globals().CLIP_IDT = clip_idt
@@ -28,6 +31,7 @@ class SenderTests(unittest.TestCase):
         lua.globals().REVERSE = reverse
         lua.globals().AUDIO = audio
         lua.globals().SELECTION = selection
+        lua.globals().DRT_POOL = drt_pool
         if fcpxml is not None:
             xsltproc = shutil.which('xsltproc')
             if not xsltproc:
@@ -60,11 +64,14 @@ class SenderTests(unittest.TestCase):
             ["Frames"]="1000",["Resolution"]="1920x1080",
             ["Start TC"]="01:00:00;00",["Field Dominance"]="Upper Field First"}
         local mpi = {GetClipProperty=function() return props end}
+        if DRT_POOL then mpi.GetMediaId = function() return '12345678-1234-1234-1234-123456789abc' end end
         local base = {
             GetLeftOffset=function() return 100 end,
             GetRightOffset=function() return 800 end,
             GetSourceStartFrame=function() return REVERSE and 199 or 100 end,
             GetSourceEndFrame=function() return REVERSE and 100 or 199 end,
+            GetSourceStartTime=function() return SOURCE_IN_TIME end,
+            GetSpeed=function() return SPEED_PERCENTAGE and {Percentage=SPEED_PERCENTAGE} end,
             GetClipEnabled=function() return true end,
             GetMediaPoolItem=function() return mpi end,
             GetName=function() return '日本語 "clip"\\nline\\t' end,
@@ -138,6 +145,19 @@ class SenderTests(unittest.TestCase):
                         close=function() return true end}
             end
         end
+        if DRT_POOL then
+            resolve.EXPORT_DRT = 2
+            timeline.Export = function(self, path, format)
+                assert(path == '/mock/orientation.drt' and format == 2)
+                return true
+            end
+            os.tmpname = function() return '/mock/orientation' end
+            os.remove = function() end
+            io.popen = function(command)
+                assert(command:find('/usr/bin/unzip -p', 1, true))
+                return {read=function() return DRT_POOL end, close=function() return true end}
+            end
+        end
         ''')
         modified = source.replace('ensure_dir(BRIDGE_DIR)', '-- test: no directory creation')
         if overrides:
@@ -162,6 +182,35 @@ class SenderTests(unittest.TestCase):
         self.assertAlmostEqual(d['clips'][0]['camera_fps'], 24000 / 1001)
         self.assertEqual(d['clips'][0]['source_rotation'], -90)
         self.assertNotIn('source_rotation', self.run_sender()['clips'][0])
+
+    def test_drt_orientation_uses_media_id_and_subtracts_the_embedded_angle(self):
+        def media(id, radiometry):
+            return (f'<Sm2MpVideoClip DbId="db-id"><UniqueMediaPoolItemId>{id}</UniqueMediaPoolItemId>'
+                    f'<Video><BtVideoInfo DbId="video-info"><Radiometry>{radiometry}</Radiometry>'
+                    '</BtVideoInfo></Video></Sm2MpVideoClip>')
+
+        header = '<!--DbAppVer="21.2.0.0006" DbPrjVer="17"-->'
+        selected_id = '12345678-1234-1234-1234-123456789abc'
+        for radiometry, expected in [
+            ('80087810028801329801b401d80100', 90),
+            ('80087810028801329801b301d80100', -90),
+            ('80087810028801329801e802d80100', 180),
+            ('8008781002489803700278c80180018001880132980100d801b401', -90),
+            ('8008781002489803700278c801800180018801329801b401d801b401', None),
+            ('80087810028801329801b401d801', None),
+        ]:
+            with self.subTest(radiometry=radiometry):
+                drt = header + media('abc-a', '9801e802d80100') + media(selected_id, radiometry)
+                clip = self.run_sender(drt_pool=drt)['clips'][0]
+                self.assertEqual(clip.get('source_rotation'), expected)
+
+        drt = header + media(selected_id, '9801b401d80100')
+        manual_zero = SOURCE.replace('-- ["/path/to/clip.mov"] = 90,', '["/mock/test.mov"] = 0,')
+        self.assertNotIn('source_rotation', self.run_sender(drt_pool=drt, source=manual_zero)['clips'][0])
+        conflicting = drt + media(selected_id, '9801e802d80100')
+        self.assertNotIn('source_rotation', self.run_sender(drt_pool=conflicting)['clips'][0])
+        unknown = drt.replace('21.2.0.0006', '22.0.0.0006')
+        self.assertNotIn('source_rotation', self.run_sender(drt_pool=unknown)['clips'][0])
 
     def test_aces_sends_clip_idt_or_the_project_default_and_records_odt(self):
         params = dict(color_science='acescct', project_idt='ARRI LogC4 - CSC')
@@ -310,6 +359,23 @@ class SenderTests(unittest.TestCase):
         for raw in ['bogus', '0', '30000/0', '29.97 nonsense']:
             with self.subTest(raw=raw):
                 self.assertIsNone(self.run_sender(fps=raw))
+
+    def test_reports_resolve_speed_and_source_elapsed_time(self):
+        for percentage in (100, 100.18, 50, 0, -100):
+            with self.subTest(percentage=percentage):
+                d = self.run_sender(fps='24', srcfps='55', span=(0,257), audio=False,
+                                    speed_percentage=percentage, source_in_time=1.2345)
+                c = d['clips'][0]
+                self.assertEqual(c['src_frames'], 1000)
+                self.assertEqual(c['source_in_time'], 1.2345)
+                self.assertEqual(c['speed'], percentage / 100)
+                self.assertEqual(d['warnings'], [])
+
+    def test_one_timeline_frame_of_rounding_is_not_a_retime(self):
+        source = SOURCE.replace('local used = usedA or usedB', 'local used = 590')
+        d = self.run_sender(fps='24', srcfps='55', span=(0,257), audio=False, source=source)
+        self.assertEqual(d['clips'][0]['speed'], 1)
+        self.assertEqual(d['warnings'], [])
 
     def test_small_real_retime_is_not_rounded_by_two_percent(self):
         source=SOURCE.replace('local dur = item:GetDuration()', 'local dur = 1000')

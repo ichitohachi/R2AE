@@ -116,6 +116,7 @@
         arrilogc4: "arri-logc4",
         arriwidegamut4logc4: "arri-logc4",
         arrilogc4arriwidegamut4: "arri-logc4",
+        acescct: "acescct",
         acescg: "acescg",
         aces20651: "aces2065-1",
         blackmagicdesignfilmgen5csc: "bmd-film-gen5",
@@ -123,7 +124,9 @@
         canonlog3cinemagamutcsc: "canon-log3-cinemagamut",
         redlog3g10redwidegamutrgbcsc: "red-log3g10-rwg",
         inverserec709bt1886: "inverse-rec709-bt1886",
-        inversesrgbpiecewise: "inverse-srgb-piecewise"
+        inversesrgbpiecewise: "inverse-srgb-piecewise",
+        // Gamma 2.2の入力にはPiecewiseの逆表示変換を近似として使う。
+        inversesrgbgamma22: "inverse-srgb-piecewise"
     };
 
     function acesInputPreset(c) {
@@ -137,6 +140,29 @@
     function supportsAces2() {
         var version = /^(\d+)\.(\d+)/.exec(app.version || "");
         return version && (+version[1] > 26 || (+version[1] === 26 && +version[2] >= 5));
+    }
+
+    var DEFAULT_ACES_DISPLAY = ["sRGB - Display", "ACES 2.0 - SDR 100 nits (Rec.709)"];
+
+    function acesDisplay(odt) {
+        var key = String(odt || "").toLowerCase().replace(/^\s+|\s+$/g, "");
+        var sdrRec709 = DEFAULT_ACES_DISPLAY[1];
+        var sdrP3 = "ACES 2.0 - SDR 100 nits (P3 D65)";
+        var fixed = {
+            "rec.709 bt.1886": ["Rec.1886 Rec.709 - Display", sdrRec709, "rec709"],
+            "srgb gamma 2.2": ["Gamma 2.2 Rec.709 - Display", sdrRec709, "gamma22"],
+            "displayp3": ["Display P3 - Display", sdrP3, "display-p3"],
+            "p3-d65": ["P3-D65 - Display", sdrP3, "p3-d65"],
+            "extended displayp3 (1000 nit)": ["Display P3 HDR - Display", "ACES 2.0 - HDR 1000 nits (P3 D65)", "display-p3-hdr"]
+        };
+        if (fixed.hasOwnProperty(key)) return fixed[key];
+        var pq = /^(p3-d65|rec\.2100) st2084 \((108|500|1000|2000|4000) nit\)$/.exec(key);
+        if (!pq) return DEFAULT_ACES_DISPLAY;
+        if (pq[1] === "p3-d65") {
+            return ["ST2084-P3-D65 - Display", "ACES 2.0 - HDR " + pq[2] + " nits (P3 D65)", "p3-pq-" + pq[2]];
+        }
+        if (pq[2] === "108") return DEFAULT_ACES_DISPLAY;
+        return ["Rec.2100-PQ - Display", "ACES 2.0 - HDR " + pq[2] + " nits (Rec.2020)", "rec2100-pq-" + pq[2]];
     }
 
     function openAcesStartupProject(d, notices) {
@@ -159,10 +185,23 @@
             notices.push("ACES 2.0プロジェクトテンプレートが見つかりません");
             return;
         }
+        var display = acesDisplay(d.aces.odt);
+        if (display[2]) {
+            var matchedTemplate = new File(BRIDGE_DIR + "/color/odt/" + display[2] + ".aet");
+            try {
+                if (!matchedTemplate.exists || !app.openTemplate(matchedTemplate)) {
+                    throw new Error("表示プロファイル付きのテンプレートを開けません");
+                }
+                return display.slice(0, 2);
+            } catch (eDisplay) {
+                notices.push("Resolveの表示プロファイルを適用できないため、sRGBを使用します: " + eDisplay.toString());
+            }
+        }
         try {
             if (typeof app.openTemplate !== "function" || !app.openTemplate(template)) {
                 throw new Error("テンプレートから新規プロジェクトを作成できません");
             }
+            return DEFAULT_ACES_DISPLAY;
         } catch (e) {
             notices.push("ACES 2.0プロジェクトを開けません: " + e.toString());
         }
@@ -185,7 +224,8 @@
             return null;
         }
 
-        var template = new File(BRIDGE_DIR + "/color/r2ae-aces-inputs.aep");
+        var template = new File(BRIDGE_DIR + "/color/r2ae-aces-inputs.aepx");
+        if (!template.exists) template = new File(BRIDGE_DIR + "/color/r2ae-aces-inputs.aep");
         if (!template.exists || !new File(BRIDGE_DIR + "/color/r2ae-color-reference.mov").exists) {
             notices.push("IDTプリセットが見つかりません。colorフォルダを受信スクリプトと同じ階層に配置してください");
             return null;
@@ -193,28 +233,8 @@
 
         var project = app.project;
         if (project.colorManagementSystem === 1 && project.ocioConfigurationFile === STUDIO_CONFIG) return template;
-        // ResolveのAPIがACESバージョンを空で返す場合は、AEの設定でACES 2.0を確認する。
-        if (!resolveVersion || project.file || project.numItems !== 0) {
-            notices.push("IDTを引き継ぐにはAE標準のACES 2.0 Studio v4.0を選択してください");
-            return null;
-        }
-        var previousEngine = project.colorManagementSystem;
-        var previousConfig = project.ocioConfigurationFile;
-        var previousDepth = project.bitsPerChannel;
-        try {
-            project.colorManagementSystem = 1;
-            project.ocioConfigurationFile = STUDIO_CONFIG;
-            project.bitsPerChannel = 32;
-            if (project.ocioConfigurationFile !== STUDIO_CONFIG) throw new Error("ACES 2.0 Studio v4.0を設定できません");
-            notices.push("AEのWorking Color Spaceで ACES/ACEScg を選択してください");
-            return template;
-        } catch (e) {
-            project.colorManagementSystem = previousEngine;
-            project.ocioConfigurationFile = previousConfig;
-            project.bitsPerChannel = previousDepth;
-            notices.push("AEでIDTを自動設定できません: " + e.toString());
-            return null;
-        }
+        notices.push("IDTを引き継ぐにはAE標準のACES 2.0 Studio v4.0を選択してください");
+        return null;
     }
 
     // AEの素材差し替えは、プリセットに設定済みのOCIO入力色空間を保持する。
@@ -294,8 +314,6 @@
 
     // この転送内だけで再利用。既存コンプの手動解釈/プロキシに影響されない。
     var imported = {};
-    var sourcePrecomps = {};
-    var sourcePrecompFolder = null;
     function cameraRateCorrection(c) {
         if (c.is_sequence || !(c.camera_fps > 0) || !(c.src_fps > 0)) return 0;
         var whole = Math.round(c.src_fps);
@@ -391,75 +409,8 @@
         var orientedHeight = quarterTurn ? width : height;
         return {
             width: width, height: height, rotation: rotation, quarterTurn: quarterTurn,
-            orientedWidth: orientedWidth, orientedHeight: orientedHeight,
             fit: getFitFactor(d.input_scaling, orientedWidth, orientedHeight, d.width, d.height)
         };
-    }
-
-    function getSourcePrecomp(footage, c, d, geometry, notices) {
-        var fit = geometry.fit;
-        var needsScaling = fit.x !== 1 || fit.y !== 1;
-        if (!geometry.rotation && !needsScaling) return null;
-        if ((footage.pixelAspect || 1) !== 1 || (d.pixel_aspect || 1) !== 1) {
-            notices.push(c.name + ": 非正方形ピクセルのため、入力スケーリングはメインのTransformで再現");
-            return null;
-        }
-
-        var still = footage.mainSource.isStill;
-        var sourceFps = still ? d.fps : footage.frameRate;
-        var duration = still
-            ? Math.max(d.duration / d.fps, c.source_in / (c.src_fps || d.fps) + c.duration / d.fps)
-            : footage.duration;
-        var key = [footage.id, geometry.rotation, fit.x, fit.y, duration].join("|");
-        if (sourcePrecomps[key]) return sourcePrecomps[key];
-
-        function addStage(source, suffix, width, height, scale, rotation, collapse) {
-            var stage = app.project.items.addComp(footage.name + suffix, width, height, 1, duration, sourceFps);
-            try {
-                if (stage.duration + stage.frameDuration / 2 < duration) {
-                    throw new Error("AEのコンポの尺の上限を超えています");
-                }
-                stage.preserveNestedFrameRate = !still;
-                var mediaLayer = stage.layers.add(source);
-                mediaLayer.startTime = 0;
-                mediaLayer.inPoint = 0;
-                mediaLayer.outPoint = Math.min(stage.duration, duration);
-                if (collapse) mediaLayer.collapseTransformation = true;
-                var group = mediaLayer.property("ADBE Transform Group");
-                group.property("ADBE Anchor Point").setValue([source.width / 2, source.height / 2]);
-                group.property("ADBE Position").setValue([stage.width / 2, stage.height / 2]);
-                group.property("ADBE Scale").setValue(scale);
-                group.property("ADBE Rotate Z").setValue(rotation);
-                stage.parentFolder = sourcePrecompFolder;
-                return stage;
-            } catch (e) {
-                stage.remove();
-                throw e;
-            }
-        }
-
-        var oriented = null;
-        try {
-            if (!sourcePrecompFolder) sourcePrecompFolder = getOrCreateFolder("Resolve Source Precomps");
-            if (geometry.rotation) {
-                oriented = addStage(footage, " - Orientation", geometry.orientedWidth,
-                    geometry.orientedHeight, [100, 100], geometry.rotation, false);
-            }
-            var precomp = oriented;
-            if (needsScaling) {
-                // ピクセルの端数は内側へ丸め、コラップスで元の倍率と枠外の画素を保つ。
-                var width = Math.floor(geometry.orientedWidth * fit.x + 1e-7);
-                var height = Math.floor(geometry.orientedHeight * fit.y + 1e-7);
-                precomp = addStage(oriented || footage, " - Input Scaling", width, height,
-                    [fit.x * 100, fit.y * 100], 0, !!oriented);
-            }
-            sourcePrecomps[key] = precomp;
-            return precomp;
-        } catch (e) {
-            if (oriented) oriented.remove();
-            notices.push(c.name + ": 素材プリコンを作成できないため、メインのTransformで再現: " + e.toString());
-            return null;
-        }
     }
 
     // 曲線ごとに異なるキー時刻を持てる。アンカーと位置を合成するときにも使う。
@@ -484,10 +435,9 @@
         return values;
     }
 
-    function applyTransform(layer, c, d, geometry, precomp, notices) {
+    function applyTransform(layer, c, d, geometry, notices) {
         var t = c.transform;
-        var orientation = precomp ? 0 : geometry.rotation;
-        var quarterTurn = !precomp && geometry.quarterTurn;
+        var orientation = geometry.rotation;
         // Match names must be resolved from their immediate parent group.
         var group = layer.property("ADBE Transform Group");
         if (!group) throw new Error("Transformグループを取得できません");
@@ -543,9 +493,9 @@
 
         var compW = d.width || 1920;
         var compH = d.height || 1080;
-        var srcW = precomp ? precomp.width : geometry.width;
-        var srcH = precomp ? precomp.height : geometry.height;
-        var fit = precomp ? { x: 1, y: 1 } : geometry.fit;
+        var srcW = geometry.width;
+        var srcH = geometry.height;
+        var fit = geometry.fit;
         var signX = (t.flip_x === true || t.flip_x === 1) ? -1 : 1;
         var signY = (t.flip_y === true || t.flip_y === 1) ? -1 : 1;
 
@@ -553,7 +503,7 @@
             var zoom = sampleKeys(animation.scale, time, [t.zoom_x == null ? 1 : t.zoom_x, t.zoom_y == null ? 1 : t.zoom_y]);
             var x = fit.x * zoom[0] * 100 * signX;
             var y = fit.y * zoom[1] * 100 * signY;
-            return quarterTurn ? [y, x] : [x, y];
+            return geometry.quarterTurn ? [y, x] : [x, y];
         });
 
         // Resolveのアンカーはピボット。AEではアンカーと表示位置の両方へ反映する。
@@ -584,20 +534,30 @@
         }
     }
 
+    function sourceTiming(c, fps, footage) {
+        var hasMotion = footage.hasVideo && !footage.mainSource.isStill;
+        var srcFps = c.src_fps > 0 ? c.src_fps : (hasMotion ? footage.frameRate : fps);
+        var aeFps = hasMotion ? footage.frameRate : srcFps;
+        // VFRなどでデコーダーのフレーム数が異なっても、実時間が同じならコンフォームしない。
+        var useElapsedTime = hasMotion && !c.is_sequence && c.src_frames > 0
+            && (!c.camera_fps || Math.abs(c.camera_fps - srcFps) <= 0.01)
+            && Math.abs(c.src_frames - footage.duration * aeFps) > 1
+            && Math.abs(c.src_frames / srcFps - footage.duration) <= Math.max(1 / srcFps, 1 / aeFps);
+        var inSec = useElapsedTime
+            ? (c.source_in_time != null ? c.source_in_time : c.source_in / srcFps)
+            : c.source_in / aeFps;
+        return { inSec: inSec, rate: useElapsedTime ? 1 : srcFps / aeFps,
+            needsConform: !useElapsedTime && hasMotion && Math.abs(srcFps - aeFps) > 0.01 };
+    }
+
     // レイヤーの配置。リタイムがある場合はタイムリマップで再現する。
     // 失敗したクリップは外側で除去し、誤った等速配置を残さない。
     // 戻り値: 状態を表す文字列（診断用）
-    function placeLayer(layer, c, fps, footage) {
+    function placeLayer(layer, c, fps, footage, timing) {
         var offsetSec = c.offset / fps;
         var durSec = c.duration / fps;
-        // source_in は素材フレーム基準。動画はAEの読み込みfpsで秒へ換算し、
-        // Resolveの素材解釈fpsとの差をレイヤー速度で再現する。
-        var srcFps = (c.src_fps && c.src_fps > 0) ? c.src_fps : fps;
-        // Resolve側で素材解釈が変更された場合はレイヤー速度で表す。
-        var nativeFps = footage.hasVideo && !footage.mainSource.isStill ? footage.frameRate : srcFps;
-        if (!(c.src_fps > 0)) srcFps = nativeFps;
-        var inSec = c.source_in / nativeFps;
-        var speed = ((c.speed != null) ? c.speed : 1) * srcFps / nativeFps;
+        var inSec = timing.inSec;
+        var speed = ((c.speed != null) ? c.speed : 1) * timing.rate;
 
         function placeNormal() {
             layer.startTime = offsetSec - inSec;
@@ -605,7 +565,7 @@
             layer.outPoint = offsetSec + durSec;
         }
 
-        if (Math.abs(speed - 1) < 0.0001) {
+        if ((footage.hasVideo && footage.mainSource.isStill) || Math.abs(speed - 1) < 0.0001) {
             placeNormal();
             return "等速";
         }
@@ -698,7 +658,7 @@
     var failed = [];
     var retimed = [];
     var notices = d.warnings || [];
-    openAcesStartupProject(d, notices);
+    var startupDisplay = openAcesStartupProject(d, notices);
     app.beginUndoGroup("Import from DaVinci Resolve");
 
     try {
@@ -729,7 +689,8 @@
             + " / interlaced=" + d.interlaced
             + (d.display_start_frame != null ? " / Resolve開始フレーム=" + d.display_start_frame
                  : " / Resolve開始秒=" + d.display_start_time);
-        if (d.aces && d.aces.odt) comp.comment += "\nResolve ODT（AEで手動設定）: " + d.aces.odt;
+        if (d.aces && d.aces.odt) comp.comment += "\nResolve ODT: " + d.aces.odt;
+        if (startupDisplay) comp.comment += "\nAE Display Color Space: " + startupDisplay.join(" / ");
 
         var clips = layerImportOrder(d.clips);
         for (var i = 0; i < clips.length; i++) {
@@ -801,24 +762,21 @@
 
                 var geometry = c.kind !== "audio" && c.transform && footage.hasVideo
                     ? sourceGeometry(c, d, footage) : null;
-                var precomp = geometry ? getSourcePrecomp(footage, c, d, geometry, notices) : null;
-                layer = comp.layers.add(precomp || footage);
-                // 拡大時に元の画素を使い、プリコン枠を超えた素材もメインコンプで扱う。
-                if (precomp) layer.collapseTransformation = true;
+                layer = comp.layers.add(footage);
 
-                if (footage.hasVideo && !footage.mainSource.isStill && c.src_fps > 0
-                    && Math.abs(c.src_fps - footage.frameRate) > 0.01) {
+                var timing = sourceTiming(c, fps, footage);
+                if (timing.needsConform) {
                     notices.push(c.name + ": Resolveの素材解釈fps=" + c.src_fps
                         + " / AEの素材fps=" + footage.frameRate + "。差はTime Remapに反映（要確認）");
                 }
-                var status = placeLayer(layer, c, fps, footage);
+                var status = placeLayer(layer, c, fps, footage, timing);
                 if (status.indexOf("失敗") >= 0) {
                     failed.push(c.name + " " + status);
                 } else if (status !== "等速" && c.speed != null && c.speed !== 1) {
                     retimed.push(c.name + " -> " + status);
                 }
 
-                if (geometry) applyTransform(layer, c, d, geometry, precomp, notices);
+                if (geometry) applyTransform(layer, c, d, geometry, notices);
 
                 // Aトラック側を独立レイヤーにした場合、映像側の音声はオフにする
                 if (c.mute_audio === true && layer.hasAudio) {

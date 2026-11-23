@@ -4,13 +4,15 @@ const fs = require('node:fs');
 const vm = require('node:vm');
 const path = require('node:path');
 const source = fs.readFileSync(path.join(__dirname,'../r2ae_receive.jsx'),'utf8');
+const acesTemplate = fs.readFileSync(path.join(__dirname,'../color/r2ae-aces-project.aet'),'latin1');
 let checks=0;
 function run(data, options={}) {
     const state={comps:[],imports:[],alerts:[],undo:0,importOptions:[],presetFolders:[]};
     const document=typeof data==='string'?data:JSON.stringify(data);
     function File(name) {
         this.fsName=name;this.name=path.basename(name);
-        this.exists=!name.startsWith('/mock/color/')||!options.missingColorAssets;
+        this.exists=(!name.startsWith('/mock/color/')||!options.missingColorAssets) &&
+            (!name.startsWith('/mock/color/odt/')||!options.missingDisplayAsset);
     }
     File.prototype.open=function(){return true;};
     File.prototype.read=function(){return document;};
@@ -83,7 +85,7 @@ function run(data, options={}) {
             }},
             importFile(io){
                 if(io.importAs===2){
-                    const seeds=['sony-cine','arri-logc3','arri-logc4','acescg','aces2065-1',
+                    const seeds=['sony-cine','arri-logc3','arri-logc4','acescct','acescg','aces2065-1',
                         'bmd-film-gen5','canon-log2-cinemagamut','canon-log3-cinemagamut',
                         'red-log3g10-rwg','inverse-rec709-bt1886','inverse-srgb-piecewise'].map(name=>{
                         const f=new FootageItem(); f.name=name; f.preset=name; return f;
@@ -102,6 +104,7 @@ function run(data, options={}) {
     app.openTemplate=function(file){
         assert.equal(state.undo,0,'The template must open before the import undo group');
         state.templateOpened=file.fsName;
+        state.templateBytes=fs.readFileSync(path.join(__dirname,'..',file.fsName.slice('/mock/'.length)),'latin1');
         return Object.assign(app.project,{
             colorManagementSystem:1,ocioConfigurationFile:'ACES 2.0 Studio v4.0',bitsPerChannel:32
         });
@@ -166,9 +169,14 @@ test('A cold ACEScct transfer opens the project template before footage import',
     assert.deepEqual(s.alerts,[]);
 });
 test('Warm, older ACES and restored projects skip the startup template',()=>{
-    const d=fixture({aces:{mode:'acescct',version:''}});
+    const d=fixture({aces:{mode:'acescct',version:'aces_2.0',odt:'Rec.709 BT.1886'}});
     d.clips[0].src_idt='ARRI LogC3';
-    assert.equal(run(d,{numItems:0}).templateOpened,undefined);
+    const warm=run(d,{numItems:0,color:{workingSpace:'existing work',displayColorSpace:'existing display'}});
+    assert.equal(warm.templateOpened,undefined);
+    assert.equal(warm.project.workingSpace,'existing work');
+    assert.equal(warm.project.displayColorSpace,'existing display');
+    assert.equal(warm.project.ocioConfigurationFile,'');
+    assert.equal(warm.project.bitsPerChannel,8);
     const restored=run(d,{numItems:0,coldStart:true,color:{file:{fsName:'/saved.aep'}}});
     assert.equal(restored.templateOpened,undefined);
     d.aces.version='aces_1.3';
@@ -178,28 +186,75 @@ test('ACES 2.0 uses the stock configuration and assigns different IDTs to the sa
     const d=fixture({aces:{version:'aces_2.0',mode:'acescct',odt:'Rec.709 - 100 nits'}});
     Object.assign(d.clips[0],{src_idt:'Sony SLog3 SGamut3Cine - CSC'});
     d.clips.push({...d.clips[0],name:'other IDT',src_idt:'ARRI LogC4 - CSC'});
-    const s=run(d,{numItems:0});
+    const s=run(d,{color:{colorManagementSystem:1,ocioConfigurationFile:'ACES 2.0 Studio v4.0',bitsPerChannel:32,
+        workingSpace:'ACES/ACES2065-1',displayColorSpace:'existing display'}});
     assert.equal(s.project.colorManagementSystem,1);
     assert.equal(s.project.ocioConfigurationFile,'ACES 2.0 Studio v4.0');
     assert.equal(s.project.bitsPerChannel,32);
-    assert.match(s.alerts[0],/Working Color Space.*ACEScg/);
+    assert.equal(s.project.workingSpace,'ACES/ACES2065-1');
+    assert.equal(s.project.displayColorSpace,'existing display');
+    assert.equal(s.templateOpened,undefined);
     assert.match(s.comps[0].comment,/Resolve ODT.*Rec\.709/);
     assert.deepEqual(s.comps[0].list.map(l=>l.footage.preset),['sony-cine','arri-logc4']);
     assert.match(s.comps[0].list[0].footage.comment,/Sony SLog3 SGamut3Cine/);
     assert.ok(s.presetFolders.every(f=>f.removed));
 });
-test('ACES maps the verified camera and inverse display variants',()=>{
+test('Cold starts match verified ACES display profiles and use the sRGB template otherwise',()=>{
+    const defaultDisplay=['sRGB - Display','ACES 2.0 - SDR 100 nits (Rec.709)'];
+    const d=fixture({aces:{mode:'acescct',version:'aces_2.0'}});
+    d.clips[0].src_idt='ACEScct - CSC';
+    const mappings=[
+        ['sRGB Piecewise',...defaultDisplay],
+        ['DisplayP3 Gamma 2.2',...defaultDisplay],
+        ['unknown',...defaultDisplay],
+        ['Rec.709 BT.1886','Rec.1886 Rec.709 - Display',defaultDisplay[1]],
+        ['sRGB Gamma 2.2','Gamma 2.2 Rec.709 - Display',defaultDisplay[1]],
+        ['DisplayP3','Display P3 - Display','ACES 2.0 - SDR 100 nits (P3 D65)'],
+        ['P3-D65','P3-D65 - Display','ACES 2.0 - SDR 100 nits (P3 D65)'],
+        ['Extended DisplayP3 (1000 nit)','Display P3 HDR - Display','ACES 2.0 - HDR 1000 nits (P3 D65)'],
+    ];
+    for(const n of [108,500,1000,2000,4000])
+        mappings.push([`P3-D65 ST2084 (${n} nit)`,'ST2084-P3-D65 - Display',`ACES 2.0 - HDR ${n} nits (P3 D65)`]);
+    for(const n of [500,1000,2000,4000])
+        mappings.push([`Rec.2100 ST2084 (${n} nit)`,'Rec.2100-PQ - Display',`ACES 2.0 - HDR ${n} nits (Rec.2020)`]);
+
+    const marker=acesTemplate.indexOf('pdvc');
+    const profileStart=marker+18;
+    const oldSize=Buffer.from(acesTemplate,'latin1').readUInt32BE(profileStart-4);
+    for(const [odt,display,view] of mappings){
+        d.aces.odt=odt;
+        const s=run(d,{numItems:0,coldStart:true});
+        const bytes=Buffer.from(s.templateBytes,'latin1');
+        const size=bytes.readUInt32BE(profileStart-4);
+        const profile=JSON.parse(s.templateBytes.slice(profileStart,profileStart+size));
+        assert.deepEqual(JSON.parse(Buffer.from(profile.baseColorProfile.colorProfileData,'base64')),{
+            colorSpace1:display,colorSpace2:view,ocioColorSpaceType:1
+        },odt);
+        assert.ok(s.comps[0].comment.includes(`AE Display Color Space: ${display} / ${view}`),odt);
+        assert.equal(s.comps[0].list[0].footage.preset,'acescct');
+        assert.equal(s.templateBytes.slice(8,profileStart-4),acesTemplate.slice(8,profileStart-4));
+        assert.equal(s.templateBytes.slice(profileStart+size+size%2),acesTemplate.slice(profileStart+oldSize+oldSize%2));
+        assert.equal(bytes.readUInt32BE(4)-Buffer.from(acesTemplate,'latin1').readUInt32BE(4),
+            size+size%2-oldSize-oldSize%2);
+    }
+    d.aces.odt='Rec.709 BT.1886';
+    const fallback=run(d,{numItems:0,coldStart:true,missingDisplayAsset:true});
+    assert.equal(fallback.templateOpened,'/mock/color/r2ae-aces-project.aet');
+    assert.match(fallback.alerts[0],/sRGBを使用/);
+});
+test('ACES maps supported camera and inverse display inputs',()=>{
     const color={colorManagementSystem:1,ocioConfigurationFile:'ACES 2.0 Studio v4.0'};
     const d=fixture({aces:{mode:'acescct'}});
     for(const [idt,preset] of [
+        ['ACEScct - CSC','acescct'],
         ['Blackmagic Design Film Gen 5 - CSC','bmd-film-gen5'],
         ['Canon Log 2 Cinema Gamut - CSC','canon-log2-cinemagamut'],
         ['Canon Log 3 Cinema Gamut - CSC','canon-log3-cinemagamut'],
         ['RED Log3G10 REDWideGamutRGB - CSC','red-log3g10-rwg'],
         ['Inverse Rec.709 BT.1886','inverse-rec709-bt1886'],
         ['Inverse sRGB Piecewise','inverse-srgb-piecewise'],
+        ['Inverse sRGB Gamma 2.2','inverse-srgb-piecewise'],
         ['Inverse Rec.709 BT.1886 (D60 simulation)',undefined],
-        ['Inverse sRGB Gamma 2.2',undefined],
         ['sRGB',undefined],
         ['Rec.709',undefined],
         ['Canon Log 2 Rec.2020 - CSC',undefined],
@@ -259,82 +314,87 @@ test('video order follows start times from the bottom while overlapping upper tr
         '[V3] top','[V2] overlap','[V1] bottom','[V1] first','[A1] sound'
     ]);
 });
-test('orientation and input scaling both frame their image tightly and leave Inspector rotation outside',()=>{
+test('orientation, scaling and inspector transforms use the original footage layer',()=>{
     const d=fixture({fps:24});
     Object.assign(d.clips[0],{src_w:2160,src_h:3840,source_rotation:90,
         transform:{zoom_x:1.2,zoom_y:0.8,anchor_x:100,anchor_y:50,flip_x:true},
         transform_keys:{rotation:[[0,0],[1,20]]}});
     const s=run(d,{width:2160,height:3840});
     const l=s.comps[0].list[0];
-    const oriented=s.comps[1], scaled=s.comps[2];
-    const inner=oriented.list[0].property('ADBE Transform Group');
-    const fit=scaled.list[0].property('ADBE Transform Group');
-    assert.equal(l.footage,scaled);
-    assert.equal(l.collapseTransformation,true);
-    assert.equal(scaled.list[0].footage,oriented);
-    assert.equal(scaled.list[0].collapseTransformation,true);
-    assert.deepEqual([oriented.width,oriented.height],[3840,2160]);
-    assert.deepEqual([scaled.width,scaled.height],[1920,1080]);
-    assert.equal(scaled.frameRate,s.imports[0].frameRate);
-    assert.equal(scaled.duration,s.imports[0].duration);
-    assert.deepEqual(Array.from(inner.property('ADBE Scale').value),[100,100]);
-    assert.equal(inner.property('ADBE Rotate Z').value,90);
-    assert.deepEqual(Array.from(fit.property('ADBE Scale').value),[50,50]);
-    assert.equal(fit.property('ADBE Rotate Z').value,0);
+    assert.equal(s.comps.length,1);
+    assert.equal(l.footage,s.imports[0]);
     const t=l.property('ADBE Transform Group');
-    assert.deepEqual(Array.from(t.property('ADBE Scale').value),[-120,80]);
-    assert.deepEqual(Array.from(t.property('ADBE Anchor Point').value),[1060,490]);
-    assert.deepEqual(t.property('ADBE Rotate Z').keys.map(k=>k.v),[0,20]);
+    assert.deepEqual(Array.from(t.property('ADBE Scale').value),[40,-60]);
+    assert.deepEqual(Array.from(t.property('ADBE Anchor Point').value),[980,1720]);
+    assert.deepEqual(t.property('ADBE Rotate Z').keys.map(k=>k.v),[90,110]);
 
     d.input_scaling='stretch';
     d.height=960;
     d.clips[0].source_rotation=-90;
     d.clips[0].transform={};
-    const stretched=run(d,{width:2160,height:3840}).comps[2];
-    assert.deepEqual([stretched.width,stretched.height],[1920,960]);
-    assert.deepEqual(Array.from(stretched.list[0].property('ADBE Transform Group').property('ADBE Scale').value),
-        [50,960/2160*100]);
+    delete d.clips[0].transform_keys;
+    const stretched=run(d,{width:2160,height:3840});
+    const transform=stretched.comps[0].list[0].property('ADBE Transform Group');
+    assert.equal(stretched.comps.length,1);
+    assert.deepEqual(Array.from(transform.property('ADBE Scale').value),[960/2160*100,50]);
+    assert.equal(transform.property('ADBE Rotate Z').value,-90);
 
     d.input_scaling='none';
-    const rotationOnly=run(d,{width:2160,height:3840});
-    assert.equal(rotationOnly.comps.length,2);
-    assert.equal(rotationOnly.comps[1].list[0].property('ADBE Transform Group').property('ADBE Rotate Z').value,-90);
+    const original=run(d,{width:2160,height:3840});
+    assert.equal(original.comps.length,1);
+    assert.deepEqual(Array.from(original.comps[0].list[0].property('ADBE Transform Group').property('ADBE Scale').value),
+        [100,100]);
 });
-test('input scaling precomp stops inside fractional Fit bounds and leaves its exact scale',()=>{
+test('Fit scales the direct footage layer without creating another composition',()=>{
     const s=run(fixture(),{width:2160,height:3840});
-    const scaled=s.comps[1], fit=scaled.list[0].property('ADBE Transform Group');
-    assert.deepEqual([scaled.width,scaled.height],[607,1080]);
-    assert.deepEqual(Array.from(fit.property('ADBE Scale').value),[28.125,28.125]);
+    const l=s.comps[0].list[0];
+    assert.equal(s.comps.length,1);
+    assert.equal(l.footage,s.imports[0]);
+    assert.deepEqual(Array.from(l.property('ADBE Transform Group').property('ADBE Scale').value),
+        [28.125,28.125]);
 });
-test('precomp reuse preserves separate audio, trim, and retime',()=>{
+test('VFR is placed by elapsed time while preserving deliberate speed changes',()=>{
+    const d=fixture({fps:24,duration:257});
+    Object.assign(d.clips[0],{src_fps:55,src_frames:590,source_in:55,source_in_time:0.98,
+        duration:100,src_field:'Progressive'});
+    const options={width:2880,height:1800,nativeFps:56.261962890625,sourceDuration:10.7354875404358};
+    const s=run(d,options);
+    const l=s.comps[0].list[0];
+    assert.equal(l.startTime,-0.98);
+    assert.equal(l.property('ADBE Time Remapping').keys.length,0);
+    assert.deepEqual(s.alerts,[]);
+    d.clips[0].speed=2;
+    const fast=run(d,options).comps[0].list[0].property('ADBE Time Remapping').keys;
+    assert.equal(fast[0].v,0.98);
+    assert.ok(Math.abs((fast[1].v-fast[0].v)/(fast[1].t-fast[0].t)-2)<1e-10);
+});
+test('direct footage reuse preserves separate audio, trim, and retime',()=>{
     const d=fixture({fps:24,duration:80});
     Object.assign(d.clips[0],{src_fps:24,duration:20,source_in:10});
     d.clips.push({...d.clips[0],offset:30,speed:2});
     d.clips.push({...d.clips[0],offset:10,kind:'audio',mute_audio:false});
     const s=run(d,{nativeFps:24,width:1280,height:720});
-    const [audio,first,second]=s.comps[0].list, precomp=s.comps[1];
-    assert.equal(s.comps.length,2);
-    assert.equal(audio.footage,s.imports[0]);
-    assert.equal(first.footage,precomp);
-    assert.equal(second.footage,precomp);
+    const [audio,first,second]=s.comps[0].list;
+    assert.equal(s.comps.length,1);
+    assert.ok([audio,first,second].every(layer=>layer.footage===s.imports[0]));
     assert.equal(first.audioEnabled,false);
     assert.equal(first.startTime,-10/24);
     assert.equal(second.inPoint,30/24);
     assert.equal(second.outPoint,50/24);
     const keys=second.property('ADBE Time Remapping').keys;
     assert.ok(Math.abs((keys[1].v-keys[0].v)/(keys[1].t-keys[0].t)-2)<1e-10);
-    assert.deepEqual(Array.from(precomp.list[0].property('ADBE Transform Group').property('ADBE Scale').value),
-        [150,150]);
+    assert.deepEqual(Array.from(first.property('ADBE Transform Group').property('ADBE Scale').value),[150,150]);
 });
-test('still source precomp spans the edit even when source IN exceeds the importer duration',()=>{
+test('a direct still layer spans the edit even when source IN exceeds the importer duration',()=>{
     const d=fixture({fps:24,duration:80});
-    Object.assign(d.clips[0],{source_in:72,src_fps:24,duration:48});
+    Object.assign(d.clips[0],{source_in:72,src_fps:24,duration:48,speed:0});
     const s=run(d,{still:true,width:1280,height:720,sourceDuration:1});
-    const precomp=s.comps[1], layer=s.comps[0].list[0];
-    assert.equal(precomp.duration,5);
-    assert.equal(precomp.list[0].outPoint,5);
+    const layer=s.comps[0].list[0];
+    assert.equal(s.comps.length,1);
+    assert.equal(layer.footage,s.imports[0]);
     assert.equal(layer.startTime,-3);
     assert.equal(layer.outPoint,2);
+    assert.equal(layer.property('ADBE Time Remapping').keys.length,0);
 });
 test('retime key clipping preserves slope and layer duration',()=>{
     const d=fixture();d.clips[0].speed=-1;d.clips[0].source_in=29;d.clips[0].src_fps=30000/1001;
@@ -374,9 +434,9 @@ test('nondefault Resolve scale position anchor and rotation are applied through 
     const d=fixture();Object.assign(d.clips[0],{src_w:3840,src_h:2160,
         transform:{zoom_x:0.32,zoom_y:0.32,pan:0,tilt:0,anchor_x:-950,anchor_y:478,rotation:35.73,opacity:70}});
     const l=run(d,{width:3840,height:2160}).comps[0].list[0],t=l.property('ADBE Transform Group');
-    assert.deepEqual(Array.from(t.property('ADBE Scale').value),[32,32]);
+    assert.deepEqual(Array.from(t.property('ADBE Scale').value),[16,16]);
     assert.deepEqual(Array.from(t.property('ADBE Position').value),[10,62]);
-    assert.deepEqual(Array.from(t.property('ADBE Anchor Point').value),[10,62]);
+    assert.deepEqual(Array.from(t.property('ADBE Anchor Point').value),[20,124]);
     assert.equal(t.property('ADBE Rotate Z').value,35.73);
     assert.equal(t.property('ADBE Opacity').value,70);
 });
