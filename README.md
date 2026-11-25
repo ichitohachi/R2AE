@@ -19,7 +19,7 @@ This is not a persistent link like Adobe Dynamic Link. Each time you run it, the
 - Transfers the current timeline's resolution, fps, DF/NDF display, input sizing and the start timecode of the transferred span
 - Converts each clip's Zoom, Pan/Tilt, Rotation, Anchor Point, Flip, and Opacity into AE's Scale / Position / Rotation / Anchor Point / Opacity
 - On macOS, rebuilds exported position, zoom, rotation, anchor point, and opacity keys as editable After Effects keyframes
-- Reproduces constant-speed retiming via AE's Time Remap, with a check to avoid misreading frame-rate conforms as speed changes
+- Uses editable AE Time Remap keys for speed changes. On macOS it can match source frames for Resolve Nearest retimes, including supported linear variable-speed segments.
 - Merges matching audio into video layers and keeps other audio on separate layers. Channel mapping is unsupported.
 - Prevents double playback of audio linked to a video clip
 - Reuses matching footage within a transfer; subsequent transfers import fresh footage to isolate interpretation settings
@@ -27,7 +27,7 @@ This is not a persistent link like Adobe Dynamic Link. Each time you run it, the
 ## What it doesn't do
 
 - Real-time sync (this is not a persistent link like Dynamic Link)
-- Transitions, speed ramps (variable speed), and keyframes for Fusion or effects
+- Transitions, eased speed ramps, and keyframes for Fusion or effects
 - Color grading, Resolve-side effects, cropping, compound clips, Fusion clips, titles
 - Pitch / Yaw (3D tilt) — not supported due to differences in projection models between the two applications
 
@@ -131,17 +131,21 @@ On macOS, R2AE extracts keys for the selected clips from a temporary Resolve FCP
 
 Image sequences use their Resolve source fps. For movies, when Resolve's clip fps matches the camera's fractional 1000/1001 rate and AE imports at the corresponding whole fps, R2AE sets the footage interpretation to the camera rate. R2AE uses the clip speed reported by Resolve when available. When Resolve and AE report different source frame counts but agree on the elapsed duration within about one frame, R2AE places the clip by elapsed time. Frame-rate reinterpretation still uses Time Remap. DF is timecode numbering, not frame removal. Composition DF is explicitly set; source DF and Resolve-only source timecode overrides are not guaranteed. Source timecode and FPS metadata are recorded in comments.
 
+For progressive footage on a progressive timeline, macOS uses the Resolve FCPXML time map and precise trim data to match individual source frames when the retime process is Nearest. This covers constant speed, reverse, freeze, and variable speeds represented by linear time-map segments. The original footage remains on the layer and the Time Remap keys are editable. R2AE keeps selected audio for these clips on a separate layer so frame matching does not change its playback cadence. Variable-speed audio still transfers using a constant rate.
+
+For retimed clips whose source fps differs from the timeline fps, Resolve 21.2's DRT export supplies the original time-map points, trim, and effective source rate. R2AE uses those values to choose source frames with the original footage interpretation in AE. If DRT timing is unavailable, R2AE reports that it is using the FCPXML approximation.
+
 Video layers run bottom to top in start-time order where possible. Overlaps retain Resolve's video track priority. R2AE adds the original footage directly to the main composition. The layer Transform combines input scaling and source orientation with the Resolve Inspector transforms.
 
 On macOS with Resolve 21.2, R2AE reads Clip Attributes > Image Orientation from a temporary DRT timeline export. It applies the difference from the source file's embedded orientation. `SOURCE_ROTATION_BY_PATH` is available for manual overrides and other Resolve versions.
 
-Recognized source Field Dominance values set AE field separation. Unknown values retain importer interpretation and produce a notice. Field rendering is an output setting and must be configured separately. The verified setting key is `timelineInterlaceProcessing`. Interlaced API rates >= 49 use field ticks: composition fps and timeline coordinates are divided by two together, preserving elapsed seconds; source trimming still uses the original API clock. Progressive 59.94 fps remains unchanged. The Resolve API values were read live; the updated interlaced composition has not yet been verified live in AE.
+R2AE uses Resolve's effective source Field Dominance to set AE field separation. Unknown values retain the importer's interpretation and produce a notice. Field rendering is set separately in AE's render settings. When `timelineInterlaceProcessing` is on and the API rate is at least 49, R2AE divides the timeline tick rate and positions by two to express them in full frames. Progressive 59.94 fps retains its frame rate. A macOS test of 1080i59.94 DF verified 17,982 frames, the timecode span and all 12 progressive edits in AE. Separate tests checked the field order and temporal samples of upper- and lower-field-first footage.
 
-In auto mode, matching source, timing, trim and speed allow one A item to enable embedded audio on one video layer. Unmatched audio stays separate; video without a matching A item stays muted. `DEDUPE_AUDIO` defaults to false. Channel mapping, volume, pan, Fairlight processing, pitch preservation and sample-accurate audio trims are unsupported. Retime estimation, field interpretation, non-square-pixel transforms, freezes, VFR and Optical Flow still require real application verification. See the Japanese review for the test matrix.
+In auto mode, matching source, timing, trim and speed allow one A item to enable embedded audio on one video layer. Unmatched audio stays separate and video without a matching A item stays muted. `DEDUPE_AUDIO` defaults to false. Channel mapping, volume, pan, Fairlight processing, pitch preservation and sample-accurate audio trims are unsupported.
 
 ## Known limitations
 
-- When Resolve does not return clip speed, R2AE estimates constant retimes from the source and timeline frame ranges. Variable-speed curves are unsupported.
+- Frame Blend, Optical Flow, Speed Warp, eased retime curves, interlaced retimes, and VFR footage can differ between applications. If a frame map cannot be used, R2AE falls back to a constant rate. When Resolve does not report a speed, the rate is estimated from the source and timeline frame ranges. Windows uses the constant-speed path.
 - Pitch / Yaw are not supported, since Resolve and After Effects use different projection models and cannot be reconciled accurately
 - Windows automatic execution requires After Effects to already be running. If it isn't, R2AE doesn't launch it automatically — the Console will say so, and the JSON stays written so you can pick it up later (open After Effects, then run the script manually)
 

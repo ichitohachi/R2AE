@@ -353,7 +353,7 @@ local function get_speed(item, srcFps, frames)
     local percentage = ok and type(options) == "table" and tonumber(options.Percentage)
     if percentage and math.abs(percentage) < math.huge then
         if reverse then percentage = -math.abs(percentage) end
-        return percentage / 100, nil
+        return percentage / 100, nil, true
     end
 
     if not srcFps then return 1, nil end
@@ -427,10 +427,20 @@ local function collect_track(trackType, trackIndex)
                             if ok then sourceInTime = tonumber(value) end
                         end
 
-                        local speed = 1
+                        local speed, retimeStart, retimeEnd = 1, nil, nil
                         if ENABLE_SPEED then
-                            local sp, info = get_speed(item, srcFps, frames)
+                            local sp, info, nativeSpeed = get_speed(item, srcFps, frames)
                             speed = sp
+                            if not IS_WINDOWS and trackType == "video" and nativeSpeed and speed ~= 1 then
+                                if speed < 0 then
+                                    local ok, value = pcall(function() return item:GetSourceEndTime() end)
+                                    if ok then retimeEnd = tonumber(value) end
+                                elseif speed > 0 then
+                                    -- 左オフセットは速度変更後のタイムライン基準。小数部を保つ。
+                                    local ok, left = pcall(function() return item:GetLeftOffset(true) end)
+                                    if ok and type(left) == "number" then retimeStart = left * speed / fps end
+                                end
+                            end
                             if info then
                                 print(string.format("  [retime] %s : %s",
                                     item:GetName(), info))
@@ -452,6 +462,14 @@ local function collect_track(trackType, trackIndex)
                             if ok and type(id) == "string" and id ~= "" then mediaID = id end
                         end
 
+                        local sourceField = props["Field Dominance"]
+                        if trackType == "video" and (sourceField == nil or sourceField == ""
+                            or tostring(sourceField):lower() == "auto") then
+                            -- 属性一覧がAutoでも、個別取得では実際のフィールド順を返すことがある。
+                            local ok, effective = pcall(function() return mpi:GetClipProperty("Field Dominance") end)
+                            if ok and type(effective) == "string" and effective ~= "" then sourceField = effective end
+                        end
+
                         table.insert(collected, {
                             name = item:GetName(),
                             path = path,
@@ -463,13 +481,15 @@ local function collect_track(trackType, trackIndex)
                             source_in = sourceIn,
                             mute_audio = false,
                             speed = speed,
+                            retime_start = retimeStart,
+                            retime_end = retimeEnd,
                             src_fps = srcFps,
                             src_frames = frames,
                             source_in_time = sourceInTime,
                             camera_fps = not isSequence and parse_fps(props["Camera FPS"]) or nil,
                             src_fps_raw = tostring(props["FPS"] or ""),
                             src_start_tc = tostring(props["Start TC"] or ""),
-                            src_field = tostring(props["Field Dominance"] or ""),
+                            src_field = tostring(sourceField or ""),
                             src_idt = isAces and clipIDT(props) or nil,
                             src_w = sw,
                             src_h = sh,
@@ -569,8 +589,15 @@ local function resolve_audio_duplicates(list)
             if count == 1 then
                 for _, v in ipairs(list) do
                     if v.kind == "video" and v.mute_audio and same_timing(c, v) then
-                        v.mute_audio = false
-                        drop = true
+                        -- コマを合わせる映像キーと、連続した音声の再生を別レイヤーに保つ。
+                        if v.retime_keys then
+                            if v.variable_speed then
+                                warn(v.name .. ": 可変速の音声は平均速度で転送されます（要確認）")
+                            end
+                        else
+                            v.mute_audio = false
+                            drop = true
+                        end
                         break -- One A item enables only one V instance.
                     end
                 end
@@ -586,20 +613,10 @@ if DEDUPE_AUDIO then dedupedList, dupeCount = dedupe_audio(collected) end
 if next(selectedTracks.audio) then
     warn("音量・パン・チャンネル割当・Fairlight処理は未転送です。分割モノ音声はAEでチャンネルを確認してください")
 end
-local finalList, mergedCount = resolve_audio_duplicates(dedupedList)
-
--- 転送する素材の最初から最後までをコンプ範囲にする。
-local minStart, maxEnd = finalList[1].start, finalList[1].start + finalList[1].duration
-for _, c in ipairs(finalList) do
-    minStart = math.min(minStart, c.start)
-    maxEnd = math.max(maxEnd, c.start + c.duration)
-end
-local totalDuration = maxEnd - minStart
-
--- ResolveのFCPXMLを1回だけ書き出し、クリップと変形キーを読み取る。
--- 元のXMLは一時ファイルで処理し、選択クリップに対応するキーだけをJSONへ渡す。
-local function read_transform_keys(clips)
-    if IS_WINDOWS or not ENABLE_TRANSFORM_KEYFRAMES or not timeline.Export or not resolve.EXPORT_FCPXML_1_9 then
+-- ResolveのFCPXMLを1回だけ書き出し、選択クリップの変形キーと速度マップを読み取る。
+local function read_timeline_keys(clips)
+    if IS_WINDOWS or not (ENABLE_TRANSFORM_KEYFRAMES or ENABLE_SPEED)
+        or not timeline.Export or not resolve.EXPORT_FCPXML_1_9 then
         return
     end
 
@@ -613,7 +630,7 @@ local function read_transform_keys(clips)
     local startFrame = timeline:GetStartFrame()
     local selected = {}
     for _, c in ipairs(clips) do
-        if c.kind == "video" and c.transform then
+        if c.kind == "video" then
             local id = clip_id(c.path, c.start - startFrame, c.duration)
             if id then selected[id] = selected[id] == nil and c or false end
         end
@@ -622,7 +639,7 @@ local function read_transform_keys(clips)
 
     local tempOK, stylePath = pcall(os.tmpname)
     if not tempOK or not stylePath then
-        warn("キーフレーム取得用の一時ファイルを作れないため、静的なTransformで転送します")
+        warn("変形キー・速度マップ取得用の一時ファイルを作れません")
         return
     end
     local xmlPath = stylePath .. ".fcpxml"
@@ -662,6 +679,18 @@ local function read_transform_keys(clips)
     <xsl:if test="(self::asset-clip or self::clip or self::video) and $asset/@hasVideo = '1' and not(@srcEnable = 'audio') and $path">
       <xsl:variable name="duration"><xsl:call-template name="seconds"><xsl:with-param name="time" select="@duration"/></xsl:call-template></xsl:variable>
       <xsl:value-of select="concat('clip', '&#9;', $timelineOffset, '&#9;', $duration, '&#9;', $path, '&#10;')"/>
+      <xsl:if test="timeMap">
+        <xsl:variable name="assetStart"><xsl:choose>
+          <xsl:when test="$asset/@start"><xsl:call-template name="seconds"><xsl:with-param name="time" select="$asset/@start"/></xsl:call-template></xsl:when>
+          <xsl:otherwise>0</xsl:otherwise>
+        </xsl:choose></xsl:variable>
+        <xsl:value-of select="concat('map', '&#9;', number($start), '&#9;', $assetStart, '&#9;', timeMap/@frameSampling, '&#10;')"/>
+        <xsl:for-each select="timeMap/timept">
+          <xsl:variable name="time"><xsl:call-template name="seconds"><xsl:with-param name="time" select="@time"/></xsl:call-template></xsl:variable>
+          <xsl:variable name="value"><xsl:call-template name="seconds"><xsl:with-param name="time" select="@value"/></xsl:call-template></xsl:variable>
+          <xsl:value-of select="concat('time', '&#9;', $time, '&#9;', $value, '&#9;', @interp, '&#10;')"/>
+        </xsl:for-each>
+      </xsl:if>
       <xsl:if test="not(timeMap or adjust-transform/@enabled = '0' or adjust-transform/@enabled = 'false')">
         <xsl:for-each select="adjust-transform/param[@name='position' or @name='anchor' or @name='rotation' or @name='scale']/keyframeAnimation/keyframe | adjust-blend/param[@name='amount']/keyframeAnimation/keyframe">
           <xsl:variable name="time"><xsl:call-template name="seconds"><xsl:with-param name="time" select="@time"/></xsl:call-template></xsl:variable>
@@ -669,12 +698,10 @@ local function read_transform_keys(clips)
         </xsl:for-each>
       </xsl:if>
     </xsl:if>
-    <xsl:if test="not(timeMap)">
-      <xsl:apply-templates select="asset-clip | clip | ref-clip | mc-clip | sync-clip | gap | spine | video[@lane] | audio[@lane]" mode="clip">
-        <xsl:with-param name="parentStart" select="number($start)"/>
-        <xsl:with-param name="parentOffset" select="$timelineOffset"/>
-      </xsl:apply-templates>
-    </xsl:if>
+    <xsl:apply-templates select="(asset-clip | clip | ref-clip | mc-clip | sync-clip | gap | spine | video[@lane] | audio[@lane])[not(../timeMap) or number(@lane) &gt; 0]" mode="clip">
+      <xsl:with-param name="parentStart" select="number($start)"/>
+      <xsl:with-param name="parentOffset" select="$timelineOffset"/>
+    </xsl:apply-templates>
   </xsl:template>
   <xsl:template match="*" mode="clip"/>
 </xsl:stylesheet>
@@ -692,8 +719,50 @@ local function read_transform_keys(clips)
     os.remove(stylePath)
     os.remove(xmlPath)
     if not ok then
-        warn("キーフレームの取得に失敗したため、静的なTransformで転送します。" .. tostring(rows))
+        warn("変形キー・速度マップを取得できませんでした。" .. tostring(rows))
         return
+    end
+
+    local function set_retime(c, map)
+        local points = map.points
+        local seconds = c.duration / fps
+        local function fallback(reason)
+            warn(c.name .. ": " .. reason .. "。速度は定速として転送します（要確認）")
+        end
+
+        if map.sampling ~= "floor" then
+            local sampling = map.sampling ~= "" and map.sampling or "不明"
+            fallback("Resolveのコマ補間 " .. sampling .. " は未対応")
+            return
+        end
+        if interlaced ~= false or not c.src_fps or (not c.is_sequence and c.src_field:lower() ~= "progressive") then
+            fallback("素材fpsまたはフィールド情報によりコマ合わせを適用できません")
+            return
+        end
+        if not map.clip_start or not map.asset_start or #points < 2 or map.unsupported then
+            fallback("速度マップの補間を読み取れません")
+            return
+        end
+
+        -- FCPXMLの定速マップは端点・クリップINの丸めや逆再生時の補正が入る。
+        -- 一定速度はResolve APIで得た高精度のトリムと速度を使う。
+        local first, last = points[1], points[#points]
+        local speed = (last[2] - first[2]) / (last[1] - first[1])
+        local sourceStart = c.retime_start
+        if c.retime_end then sourceStart = c.retime_end - map.asset_start - 1 / c.src_fps end
+        if sourceStart and #points == 2 and math.abs(speed - c.speed) < 0.001 then
+            c.retime_keys = {{0, sourceStart}, {seconds, sourceStart + seconds * c.speed}}
+            return
+        end
+
+        local lastVisibleTime = seconds - 1 / fps
+        if first[1] > 1e-6 or last[1] < lastVisibleTime - 1e-6 then
+            fallback("速度マップがクリップの表示範囲をカバーしていません")
+            return
+        end
+        local frozen = points[1][2] == points[2][2] and points[2][1] >= lastVisibleTime
+        c.variable_speed = #points > 2 and not frozen
+        c.retime_keys = points
     end
 
     local conversions = {
@@ -701,9 +770,9 @@ local function read_transform_keys(clips)
         anchor = {compH / 100, compH / 100}, rotation = {ROTATION_SIGN}, amount = {100},
     }
     local current
-    local animations = {}
+    local matches = {}
     for line in rows:gmatch("[^\r\n]+") do
-        local record, a, b, value = line:match("^(%a+)\t([^\t]+)\t([^\t]+)\t(.+)$")
+        local record, a, b, value = line:match("^(%a+)\t([^\t]+)\t([^\t]+)\t(.*)$")
         if record == "clip" then
             current = nil
             local urlPath = value:match("^file://(/.*)$") or value:match("^file://localhost(/.*)$")
@@ -714,43 +783,61 @@ local function read_transform_keys(clips)
                 end)))
                 local id = clip_id(path, offset * fps, duration * fps)
                 if id and selected[id] ~= nil then
-                    local candidates = animations[id] or {}
-                    current = {}
+                    local candidates = matches[id] or {}
+                    current = { animation = {} }
                     candidates[#candidates + 1] = current
-                    animations[id] = candidates
+                    matches[id] = candidates
                 end
             end
-        elseif record == "key" and current and conversions[a] then
+        elseif record == "map" and current and ENABLE_SPEED then
+            current.map = { clip_start = tonumber(a), asset_start = tonumber(b),
+                sampling = value, points = {} }
+        elseif record == "time" and current and current.map then
+            local map = current.map
+            local x, y = tonumber(a), tonumber(b)
+            local previous = map.points[#map.points]
+            if not x or not y or not map.clip_start or not map.asset_start
+                or (value ~= "" and value ~= "linear")
+                or (previous and x - map.clip_start <= previous[1]) then
+                map.unsupported = true
+            else
+                map.points[#map.points + 1] = {x - map.clip_start, y - map.asset_start}
+            end
+        elseif record == "key" and current and ENABLE_TRANSFORM_KEYFRAMES and conversions[a] then
             local keyTime = tonumber(b)
             local x, y = value:match("^(%S+)%s+(%S+)$")
             local factors = conversions[a]
             x, y = tonumber(x or value), tonumber(y)
             if keyTime and x and (#factors == 1 or y) then
-                local keys = current[a] or {}
+                local keys = current.animation[a] or {}
                 keys[#keys + 1] = {keyTime, x * factors[1], #factors == 2 and y * factors[2] or nil}
-                current[a] = keys
+                current.animation[a] = keys
             end
         end
     end
-    for id, candidates in pairs(animations) do
-        for _, animation in ipairs(candidates) do
-            if next(animation) then
-                if selected[id] and #candidates == 1 then
-                    for _, keys in pairs(animation) do
-                        table.sort(keys, function(a, b) return a[1] < b[1] end)
-                    end
-                    selected[id].transform_keys = animation
-                else
-                    -- 同一位置・同一尺の同じ素材はトラックを特定できない。
-                    warn("同じ素材・位置・尺のクリップが重なっているため、該当するキーフレームは転送できません")
+    for id, candidates in pairs(matches) do
+        local c = selected[id]
+        if c and #candidates == 1 then
+            local candidate = candidates[1]
+            if next(candidate.animation) then
+                for _, keys in pairs(candidate.animation) do
+                    table.sort(keys, function(a, b) return a[1] < b[1] end)
                 end
-                break
+                c.transform_keys = candidate.animation
+            end
+            if candidate.map then set_retime(c, candidate.map) end
+        else
+            for _, candidate in ipairs(candidates) do
+                if next(candidate.animation) or candidate.map then
+                    warn("同じ素材・位置・尺のクリップが重なっているため、該当する変形キー・速度マップは転送できません")
+                    break
+                end
             end
         end
     end
 end
 
-read_transform_keys(finalList)
+read_timeline_keys(dedupedList)
 
 -- Resolve 21.2のBtVideoInfo/RadiometryはProtocol Buffersのワイヤー形式。
 -- 19は適用後、27は素材由来の角度。両方とも時計回りを正とするsint32。
@@ -799,62 +886,291 @@ local function read_radiometry_rotation(hex)
     end
 end
 
-local function read_source_rotations(clips)
-    if IS_WINDOWS or not timeline.Export or not resolve.EXPORT_DRT then return end
+local function bytes_from_hex(hex)
+    if not hex or #hex % 2 ~= 0 or hex:find("[^%x]") then return end
+    return (hex:gsub("%x%x", function(pair) return string.char(tonumber(pair, 16)) end))
+end
 
-    local selected = {}
-    for _, c in ipairs(clips) do
-        if c.kind == "video" and c.media_id and SOURCE_ROTATION_BY_PATH[c.path] == nil then
-            selected[c.media_id:lower()] = true
+local function little_endian_double(bytes, p)
+    local high, signByte = bytes:byte(p + 6, p + 7)
+    if not signByte then return end
+    local exponent = (signByte % 128) * 16 + math.floor(high / 16)
+    if exponent == 2047 then return end
+    local fraction = high % 16
+    for i = p + 5, p, -1 do fraction = fraction * 256 + bytes:byte(i) end
+    local sign = signByte < 128 and 1 or -1
+    if exponent == 0 then return sign * (fraction / 2^52) * 2^-1022 end
+    return sign * (1 + fraction / 2^52) * 2^(exponent - 1023)
+end
+
+local function read_protobuf_fields(bytes, visit)
+    local p = 1
+    local function varint()
+        local value, factor = 0, 1
+        for _ = 1, 5 do
+            local b = bytes:byte(p)
+            if not b then return end
+            p = p + 1
+            value = value + (b % 128) * factor
+            if b < 128 then return value end
+            factor = factor * 128
         end
     end
-    if not next(selected) then return end
+    while p <= #bytes do
+        local tag = varint()
+        if not tag or tag < 8 then return false end
+        local wire = tag % 8
+        local value
+        if wire == 1 then
+            value = little_endian_double(bytes, p)
+            p = p + 8
+        elseif wire == 2 then
+            local size = varint()
+            if not size or size > #bytes - p + 1 then return false end
+            value = bytes:sub(p, p + size - 1)
+            p = p + size
+        else
+            return false
+        end
+        if value == nil or not visit(math.floor(tag / 8), wire, value) then return false end
+    end
+    return true
+end
 
-    local archive
-    local ok, rotations = pcall(function()
-        local temporary = os.tmpname()
-        archive = temporary .. ".drt"
-        os.remove(temporary)
-        assert(timeline:Export(archive, resolve.EXPORT_DRT, resolve.EXPORT_NONE), "DRTを書き出せません")
-        local limit = 64 * 1024 * 1024
-        local reader = assert(io.popen("/usr/bin/unzip -p " .. shell_quote(archive)
-            .. " 'MediaPool/*/MpFolder.xml' 2>/dev/null", "r"))
-        local data = reader:read(limit + 1)
-        local closed = reader:close()
-        assert(closed and data and #data <= limit, "DRT内のメディア情報を読み込めません")
-        assert(data:match('DbAppVer="21%.2%.%d+%.%d+"%s+DbPrjVer="17"'),
-            "このResolveバージョンのDRT形式は未検証です")
-
-        local found = {}
-        for clip in data:gmatch("<Sm2MpVideoClip%s[^>]*>(.-)</Sm2MpVideoClip>") do
-            local id = clip:match("<UniqueMediaPoolItemId>([%x%-]+)</UniqueMediaPoolItemId>")
-            id = id and id:lower()
-            if id and selected[id] then
-                local video = clip:match("<Video>%s*<BtVideoInfo[^>]*>(.-)</BtVideoInfo>%s*</Video>")
-                local rotation = read_radiometry_rotation(video and video:match("<Radiometry>%s*(%x+)%s*</Radiometry>"))
-                if found[id] == nil then
-                    found[id] = rotation or false
-                elseif found[id] ~= rotation then
-                    found[id] = false
-                end
+-- Resolve 21.2 serializes linear time maps as a Qt property map whose
+-- KeyframesBA field contains protobuf data, optionally compressed with Zstandard.
+local function time_map_payload(hex)
+    local raw = bytes_from_hex(hex)
+    if not raw or #raw > 4 * 1024 * 1024 then return end
+    local p = 1
+    local function uint32()
+        local a,b,c,d = raw:byte(p, p + 3)
+        if not d then return end
+        p = p + 4
+        return ((a * 256 + b) * 256 + c) * 256 + d
+    end
+    local function byte_array()
+        local size = uint32()
+        if not size or size > #raw - p + 1 then return end
+        local value = raw:sub(p, p + size - 1)
+        p = p + size
+        return value
+    end
+    if uint32() ~= 1 then return end
+    local count = uint32()
+    if not count or count > 64 then return end
+    for _ = 1, count do
+        local key, kind = byte_array(), uint32()
+        if not key or raw:byte(p) ~= 0 then return end
+        p = p + 1
+        if kind == 10 or kind == 12 then
+            local data = byte_array()
+            if key == "\000K\000e\000y\000f\000r\000a\000m\000e\000s\000B\000A" then
+                return kind == 12 and data or nil
             end
-        end
-        return found
-    end)
-    if archive then os.remove(archive) end
-    if not ok then
-        warn("クリップ属性の回転を自動取得できません。" .. tostring(rotations))
-        return
-    end
-
-    for _, c in ipairs(clips) do
-        if c.kind == "video" and c.media_id then
-            c.source_rotation = rotations[c.media_id:lower()] or nil
+        else
+            local length = ({[1] = 1, [2] = 4, [4] = 8, [5] = 8, [6] = 8})[kind]
+            if not length or p + length - 1 > #raw then return end
+            p = p + length
         end
     end
 end
 
-read_source_rotations(finalList)
+local zstd
+local function decompress_time_map(bytes)
+    if zstd == nil then
+        local ok, library = pcall(function()
+            local ffi = require("ffi")
+            ffi.cdef([[
+                unsigned long long ZSTD_getFrameContentSize(const void *src, size_t srcSize);
+                size_t ZSTD_decompress(void *dst, size_t capacity, const void *src, size_t srcSize);
+            ]])
+            local loaded, lib = pcall(ffi.load, "libzstd.1.dylib")
+            if not loaded then
+                lib = ffi.load("/Applications/DaVinci Resolve/DaVinci Resolve.app/Contents/Libraries/libzstd.1.dylib")
+            end
+            return {ffi = ffi, lib = lib}
+        end)
+        zstd = ok and library or false
+    end
+    if not zstd then return end
+    local size = tonumber(zstd.lib.ZSTD_getFrameContentSize(bytes, #bytes))
+    if not size or size <= 0 or size > 4 * 1024 * 1024 then return end
+    local buffer = zstd.ffi.new("char[?]", size)
+    if tonumber(zstd.lib.ZSTD_decompress(buffer, size, bytes, #bytes)) ~= size then return end
+    return zstd.ffi.string(buffer, size)
+end
+
+local function native_time_map(hex)
+    local data = time_map_payload(hex)
+    if not data then return end
+    local mode, bytes = data:byte(1), data:sub(2)
+    if mode == 129 then
+        bytes = decompress_time_map(bytes)
+    elseif mode ~= 128 then
+        return
+    end
+    if not bytes then return end
+    local points = {}
+    local ok = read_protobuf_fields(bytes, function(field, wire, key)
+        if field ~= 1 or wire ~= 2 then return false end
+        local x, y = 0, 0
+        local linear = read_protobuf_fields(key, function(tag, kind, value)
+            if tag == 1 and kind == 1 then x = value; return true end
+            if tag == 2 and kind == 1 then y = value; return true end
+            return tag == 3 and kind == 2 and not value:find("[^%z]")
+        end)
+        if not linear or (#points > 0 and x <= points[#points][1]) then return false end
+        points[#points + 1] = {x, y}
+        return true
+    end)
+    if ok and #points >= 2 then return points end
+end
+
+local function replace_mixed_rate_time_maps(data, selected)
+    local function attribute(clip, tag)
+        return clip:match("<" .. tag .. ">(.-)</" .. tag .. ">")
+    end
+    local entities = { amp = "&", lt = "<", gt = ">", quot = '"', apos = "'" }
+    local function identity(track, start, duration, path)
+        if not start or not duration or not path then return end
+        return table.concat({track, start, duration, path}, "|")
+    end
+    local wanted, records = {}, {}
+    for _, c in ipairs(selected) do wanted[identity(c.track, c.start, c.duration, c.path)] = true end
+    for video in data:gmatch("<VideoTrackVec>(.-)</VideoTrackVec>") do
+        local index = 0
+        for track in video:gmatch("<Sm2TiTrack%s[^>]*>(.-)</Sm2TiTrack>") do
+            index = index + 1
+            for clip in track:gmatch("<Sm2TiVideoClip%s[^>]*>(.-)</Sm2TiVideoClip>") do
+                local path = attribute(clip, "MediaFilePath")
+                if path then path = resolve_sequence_path((path:gsub("&(%a+);", entities))) end
+                local id = identity(index, tonumber(attribute(clip, "Start")),
+                    tonumber(attribute(clip, "Duration")), path)
+                if id and wanted[id] then records[id] = records[id] == nil and clip or false end
+            end
+        end
+    end
+    for _, c in ipairs(selected) do
+        local record = records[identity(c.track, c.start, c.duration, c.path)]
+        local matched = false
+        if record and attribute(record, "MixedFrameRateAlignment") == "0" then
+            local hexRate = bytes_from_hex(attribute(record, "MediaFrameRate"))
+            local rate = hexRate and little_endian_double(hexRate, 1)
+            local rawIn = attribute(record, "In") or "0"
+            local whole, hexFraction = rawIn:match("^(%-?%d+)|(%x+)$")
+            local fraction = hexFraction and bytes_from_hex(hexFraction)
+            local trim = 0
+            if hexFraction then trim = fraction and #fraction == 8 and little_endian_double(fraction, 1) end
+            local framesIn = tonumber(whole or rawIn)
+            local keys = native_time_map(attribute(record, "MediaTimemapBA"))
+            if rate and rate > 0 and framesIn and trim and keys then
+                local start = (framesIn + trim) / fps
+                local endTime = start + (c.duration - 1) / fps
+                if keys[1][1] <= start + 1e-6 and keys[#keys][1] >= endTime - 1e-6 then
+                    for _, key in ipairs(keys) do
+                        key[1] = key[1] - start
+                        key[2] = key[2] * rate / c.src_fps
+                    end
+                    c.retime_keys = keys
+                    matched = true
+                end
+            end
+        end
+        if not matched then
+            warn(c.name .. ": 混在fpsの精密な速度マップを取得できず、FCPXMLの値で近似します（要確認）")
+        end
+    end
+end
+
+local function read_source_rotations(data, selected, clips)
+    local found = {}
+    for clip in data:gmatch("<Sm2MpVideoClip%s[^>]*>(.-)</Sm2MpVideoClip>") do
+        local id = clip:match("<UniqueMediaPoolItemId>([%x%-]+)</UniqueMediaPoolItemId>")
+        id = id and id:lower()
+        if id and selected[id] then
+            local video = clip:match("<Video>%s*<BtVideoInfo[^>]*>(.-)</BtVideoInfo>%s*</Video>")
+            local rotation = read_radiometry_rotation(video and video:match("<Radiometry>%s*(%x+)%s*</Radiometry>"))
+            if found[id] == nil then
+                found[id] = rotation or false
+            elseif found[id] ~= rotation then
+                found[id] = false
+            end
+        end
+    end
+    for _, c in ipairs(clips) do
+        if c.kind == "video" and c.media_id then
+            c.source_rotation = found[c.media_id:lower()] or nil
+        end
+    end
+end
+
+local function read_drt_metadata(clips)
+    if IS_WINDOWS then return end
+    local media, retimed = {}, {}
+    for _, c in ipairs(clips) do
+        if c.kind == "video" and c.media_id and SOURCE_ROTATION_BY_PATH[c.path] == nil then
+            media[c.media_id:lower()] = true
+        end
+        if c.retime_keys and math.abs(c.src_fps - fps) > 1e-6 then
+            retimed[#retimed + 1] = c
+        end
+    end
+    if not next(media) and #retimed == 0 then return end
+    if not timeline.Export or not resolve.EXPORT_DRT then
+        if #retimed > 0 then warn("DRT書き出し非対応のため、混在fpsの速度をFCPXMLの値で近似します（要確認）") end
+        return
+    end
+
+    local archive
+    local ok, err = pcall(function()
+        local temporary = os.tmpname()
+        archive = temporary .. ".drt"
+        os.remove(temporary)
+        assert(timeline:Export(archive, resolve.EXPORT_DRT, resolve.EXPORT_NONE), "DRTを書き出せません")
+        local function read_member(name)
+            local limit = 64 * 1024 * 1024
+            local reader = assert(io.popen("/usr/bin/unzip -p " .. shell_quote(archive)
+                .. " " .. shell_quote(name) .. " 2>/dev/null", "r"))
+            local data = reader:read(limit + 1)
+            local closed = reader:close()
+            assert(closed and data and #data <= limit, "DRTを読み込めません")
+            assert(data:match('DbAppVer="21%.2%.%d+%.%d+"%s+DbPrjVer="17"'),
+                "このResolveバージョンのDRT形式は未検証です")
+            return data
+        end
+        if next(media) then
+            local read, data = pcall(read_member, "MediaPool/*/MpFolder.xml")
+            if read then
+                read_source_rotations(data, media, clips)
+            else
+                warn("DRTから回転を取得できません。" .. tostring(data))
+            end
+        end
+        if #retimed > 0 then
+            local read, data = pcall(read_member, "SeqContainer/*.xml")
+            if read then
+                replace_mixed_rate_time_maps(data, retimed)
+            else
+                warn("混在fpsの速度をFCPXMLの値で近似します（要確認）。" .. tostring(data))
+            end
+        end
+    end)
+    if archive then os.remove(archive) end
+    if not ok then warn("DRTから回転または精密な速度マップを取得できません。" .. tostring(err)) end
+end
+
+read_drt_metadata(dedupedList)
+
+local finalList, mergedCount = resolve_audio_duplicates(dedupedList)
+
+-- 転送する素材の最初から最後までをコンプ範囲にする。
+local minStart, maxEnd = finalList[1].start, finalList[1].start + finalList[1].duration
+for _, c in ipairs(finalList) do
+    minStart = math.min(minStart, c.start)
+    maxEnd = math.max(maxEnd, c.start + c.duration)
+end
+local totalDuration = maxEnd - minStart
 
 -- ---- JSON書き出し --------------------------------------------------------
 
@@ -910,6 +1226,13 @@ for _, c in ipairs(finalList) do
             parameters[#parameters + 1] = '"' .. name .. '": [' .. table.concat(entries, ",") .. "]"
         end
         extra = extra .. ', "transform_keys": {' .. table.concat(parameters, ",") .. "}"
+    end
+    if c.retime_keys then
+        local entries = {}
+        for _, key in ipairs(c.retime_keys) do
+            entries[#entries + 1] = string.format("[%.12g,%.12g]", key[1], key[2])
+        end
+        extra = extra .. ', "retime_keys": [' .. table.concat(entries, ",") .. "]"
     end
     table.insert(parts, string.format(
         '    {"name": "%s", "path": "%s", "kind": "%s", "track": %d, ' ..

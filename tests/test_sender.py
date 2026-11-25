@@ -1,6 +1,7 @@
 """Run with Python + lupa; mocks Resolve and IO, never launches either app."""
 import json
 import shutil
+import struct
 import subprocess
 import tempfile
 import unittest
@@ -14,7 +15,9 @@ class SenderTests(unittest.TestCase):
                    srcfps='59.94', interlace='0', reverse=False, audio=True,
                    overrides='', source=SOURCE, drop=None, selection=None, fcpxml=None,
                    camera_fps=None, color_science=None, clip_idt=None, project_idt=None,
-                   speed_percentage=None, source_in_time=None, drt_pool=None):
+                   speed_percentage=None, source_in_time=None, drt_pool=None,
+                   source_field='Upper Field First', effective_source_field=None,
+                   source_end_time=None, left_offset=100, drt_timeline=None):
         lua = LuaRuntime(unpack_returned_tuples=True)
         lua.globals().FPS = fps
         lua.globals().START = start
@@ -22,6 +25,8 @@ class SenderTests(unittest.TestCase):
         lua.globals().SRCFPS = srcfps
         lua.globals().SPEED_PERCENTAGE = speed_percentage
         lua.globals().SOURCE_IN_TIME = source_in_time
+        lua.globals().SOURCE_END_TIME = source_end_time
+        lua.globals().LEFT_OFFSET = left_offset
         lua.globals().CAMERAFPS = camera_fps
         lua.globals().COLOR_SCIENCE = color_science
         lua.globals().CLIP_IDT = clip_idt
@@ -32,6 +37,9 @@ class SenderTests(unittest.TestCase):
         lua.globals().AUDIO = audio
         lua.globals().SELECTION = selection
         lua.globals().DRT_POOL = drt_pool
+        lua.globals().DRT_TIMELINE = drt_timeline
+        lua.globals().SOURCE_FIELD = source_field
+        lua.globals().EFFECTIVE_SOURCE_FIELD = effective_source_field
         if fcpxml is not None:
             xsltproc = shutil.which('xsltproc')
             if not xsltproc:
@@ -62,15 +70,19 @@ class SenderTests(unittest.TestCase):
             ["Camera FPS"]=CAMERAFPS,
             ["IDT"]=CLIP_IDT,
             ["Frames"]="1000",["Resolution"]="1920x1080",
-            ["Start TC"]="01:00:00;00",["Field Dominance"]="Upper Field First"}
-        local mpi = {GetClipProperty=function() return props end}
+            ["Start TC"]="01:00:00;00",["Field Dominance"]=SOURCE_FIELD}
+        local mpi = {GetClipProperty=function(self, key)
+            if key == "Field Dominance" then return EFFECTIVE_SOURCE_FIELD end
+            return props
+        end}
         if DRT_POOL then mpi.GetMediaId = function() return '12345678-1234-1234-1234-123456789abc' end end
         local base = {
-            GetLeftOffset=function() return 100 end,
+            GetLeftOffset=function() return LEFT_OFFSET end,
             GetRightOffset=function() return 800 end,
             GetSourceStartFrame=function() return REVERSE and 199 or 100 end,
             GetSourceEndFrame=function() return REVERSE and 100 or 199 end,
             GetSourceStartTime=function() return SOURCE_IN_TIME end,
+            GetSourceEndTime=function() return SOURCE_END_TIME end,
             GetSpeed=function() return SPEED_PERCENTAGE and {Percentage=SPEED_PERCENTAGE} end,
             GetClipEnabled=function() return true end,
             GetMediaPoolItem=function() return mpi end,
@@ -145,17 +157,25 @@ class SenderTests(unittest.TestCase):
                         close=function() return true end}
             end
         end
-        if DRT_POOL then
+        if DRT_POOL or DRT_TIMELINE then
             resolve.EXPORT_DRT = 2
+            local export, tmpname, popen = timeline.Export, os.tmpname, io.popen
             timeline.Export = function(self, path, format)
+                if format == 1 and export then return export(self, path, format) end
                 assert(path == '/mock/orientation.drt' and format == 2)
                 return true
             end
-            os.tmpname = function() return '/mock/orientation' end
+            local calls = 0
+            os.tmpname = function()
+                calls = calls + 1
+                if extract_rows and calls == 1 then return tmpname() end
+                return '/mock/orientation'
+            end
             os.remove = function() end
             io.popen = function(command)
-                assert(command:find('/usr/bin/unzip -p', 1, true))
-                return {read=function() return DRT_POOL end, close=function() return true end}
+                if not command:find('/usr/bin/unzip -p', 1, true) then return popen(command) end
+                local contents = command:find('SeqContainer', 1, true) and DRT_TIMELINE or DRT_POOL
+                return {read=function() return contents end, close=function() return true end}
             end
         end
         ''')
@@ -332,6 +352,14 @@ class SenderTests(unittest.TestCase):
         d=self.run_sender(fps='29.97')
         self.assertFalse(d['drop_frame'])
 
+    def test_auto_field_dominance_uses_effective_source_field_order(self):
+        for effective in ('Upper Field', 'Lower Field', 'Progressive', None):
+            with self.subTest(effective=effective):
+                d = self.run_sender(source_field='Auto', effective_source_field=effective)
+                self.assertEqual(d['clips'][0]['src_field'], effective or 'Auto')
+        explicit = self.run_sender(source_field='Lower Field First', effective_source_field='Upper Field')
+        self.assertEqual(explicit['clips'][0]['src_field'], 'Lower Field First')
+
     def test_interlace_converts_field_ticks_without_changing_seconds(self):
         d=self.run_sender(fps='59.94',interlace='1',start=215784,span=(0,158),audio=False,drop='1')
         self.assertAlmostEqual(d['fps'],30000/1001)
@@ -376,6 +404,117 @@ class SenderTests(unittest.TestCase):
         d = self.run_sender(fps='24', srcfps='55', span=(0,257), audio=False, source=source)
         self.assertEqual(d['clips'][0]['speed'], 1)
         self.assertEqual(d['warnings'], [])
+
+    def retime_fixture(self, points, sampling='floor', start='3601s'):
+        timepts = ''.join(f'<timept time="{t}" value="{v}" interp="{interp}"/>'
+                          for t, v, interp in points)
+        return f'''<fcpxml><resources><asset id="a" start="3600s" hasVideo="1">
+            <media-rep kind="original-media" src="file:///mock/test.mov"/>
+          </asset></resources><library><event><project>
+            <sequence tcStart="3600s"><spine>
+              <asset-clip ref="a" offset="3600s" start="{start}" duration="1s">
+                <timeMap frameSampling="{sampling}">{timepts}</timeMap>
+              </asset-clip>
+            </spine></sequence></project></event></library></fcpxml>'''
+
+    def test_constant_retime_uses_precise_resolve_trim_and_keeps_audio_separate(self):
+        xml = self.retime_fixture([('3600s', '3600s', 'linear'), ('3610s', '3620s', 'linear')])
+        d = self.run_sender(fps='24', srcfps='24', span=(0, 24), source_field='Progressive',
+                            speed_percentage=200, left_offset=50.25, fcpxml=xml)
+        a, v = d['clips']
+        self.assertEqual(a['kind'], 'audio')
+        self.assertNotIn('retime_keys', a)
+        self.assertTrue(v['mute_audio'])
+        self.assertEqual(v['retime_keys'], [[0, 4.1875], [1, 6.1875]])
+
+    def test_reverse_retime_subtracts_source_timecode_and_uses_its_first_displayed_frame(self):
+        xml = self.retime_fixture([('3600s', '3610s', 'linear'), ('3610s', '3600s', 'linear')])
+        d = self.run_sender(fps='24', srcfps='24', span=(0, 24), source_field='Progressive',
+                            speed_percentage=-100, source_end_time=3605.25, fcpxml=xml, audio=False)
+        points = d['clips'][0]['retime_keys']
+        self.assertAlmostEqual(points[0][1], 5.25 - 1 / 24)
+        self.assertAlmostEqual(points[1][1], 4.25 - 1 / 24)
+
+    def test_variable_retime_preserves_trimmed_local_times_and_nonzero_source_timecode(self):
+        xml = self.retime_fixture([('3600s', '3600s', 'linear'), ('3601s', '3602s', 'linear'),
+                                   ('7203/2s', '3602s', 'linear'), ('3602s', '3601s', 'linear')])
+        d = self.run_sender(fps='24', srcfps='24', span=(0, 24), source_field='Progressive',
+                            speed_percentage=100, fcpxml=xml, audio=False)
+        self.assertEqual(d['clips'][0]['retime_keys'], [[-1, 0], [0, 2], [0.5, 2], [1, 1]])
+
+    def test_unknown_retime_sampling_and_smooth_points_are_reported(self):
+        for sampling, interpolation in [('optical-flow', 'linear'), ('floor', 'smooth2')]:
+            with self.subTest(sampling=sampling, interpolation=interpolation):
+                xml = self.retime_fixture([('3600s', '3600s', 'linear'), ('3602s', '3604s', interpolation)],
+                                          sampling)
+                d = self.run_sender(fps='24', srcfps='24', span=(0, 24), source_field='Progressive',
+                                    speed_percentage=200, fcpxml=xml, audio=False)
+                self.assertNotIn('retime_keys', d['clips'][0])
+                self.assertIn('要確認', d['warnings'][0])
+
+    def test_variable_map_can_move_even_when_reported_average_speed_is_zero(self):
+        xml = self.retime_fixture([('3601s', '3604s', 'linear'), ('7203/2s', '3605s', 'linear'),
+                                   ('3602s', '3604s', 'linear')])
+        d = self.run_sender(fps='24', srcfps='24', span=(0, 24), source_field='Progressive',
+                            speed_percentage=0, fcpxml=xml, audio=False)
+        self.assertEqual(d['clips'][0]['retime_keys'], [[0, 4], [0.5, 5], [1, 4]])
+
+    def test_mixed_retime_uses_native_sampling_rate_and_precise_trim(self):
+        xml = self.retime_fixture([
+            ('3600s', '3600s', 'linear'), ('3601s', '3601s', 'linear'),
+            ('3602s', '3603s', 'linear')
+        ])
+        payload = bytearray([128])
+        for t, v in [(0, 0), (1, 0.5), (2, 1.75)]:
+            key = b'\x09' + struct.pack('<d', t) + b'\x11' + struct.pack('<d', v)
+            payload.extend(bytes([10, len(key)]) + key)
+        label = 'KeyframesBA'.encode('utf-16be')
+        metadata = (struct.pack('>III', 1, 1, len(label)) + label
+                    + struct.pack('>IBI', 12, 0, len(payload)) + payload).hex()
+        fractional_trim = struct.pack('<d', 0.5).hex()
+        source_rate = struct.pack('<dd', 24, 0).hex()
+        drt = f'''<!--DbAppVer="21.2.0.0006" DbPrjVer="17"-->
+          <Sm2SequenceContainer DbId="test"><VideoTrackVec><Sm2TiTrack DbId="v">
+            <Sm2TiVideoClip DbId="c"><Start>86400</Start><Duration>24</Duration>
+              <MediaFilePath>/mock/test.mov</MediaFilePath><MixedFrameRateAlignment>0</MixedFrameRateAlignment>
+              <In>10|{fractional_trim}</In><MediaFrameRate>{source_rate}</MediaFrameRate>
+              <MediaTimemapBA>{metadata}</MediaTimemapBA>
+            </Sm2TiVideoClip></Sm2TiTrack></VideoTrackVec></Sm2SequenceContainer>'''
+        opts = dict(fps='24', start=86400, srcfps='23.976', span=(0,24), source_field='Progressive',
+                    speed_percentage=150, fcpxml=xml, audio=False)
+        r = self.run_sender(drt_timeline=drt, **opts)
+        self.assertEqual(r['clips'][0]['retime_keys'], [
+            [-0.4375, 0], [0.5625, 0.5005], [1.5625, 1.75175]
+        ])
+        self.assertFalse(r['warnings'])
+        bad = self.run_sender(drt_timeline=drt.replace(metadata, '80'), **opts)
+        self.assertIn('FCPXMLの値で近似', bad['warnings'][0])
+
+    def test_connected_clip_keeps_its_map_above_a_retimed_parent(self):
+        xml = self.retime_fixture([('3600s', '3600s', 'linear'), ('3602s', '3604s', 'linear')])
+        xml = xml.replace('</asset-clip>', '''<asset-clip ref="a" lane="1" offset="3601s"
+                start="3601s" duration="1s">
+              <timeMap frameSampling="floor">
+                <timept time="3600s" value="3600s" interp="linear"/>
+                <timept time="3603s" value="3606s" interp="linear"/>
+              </timeMap></asset-clip></asset-clip>''', 1)
+        d = self.run_sender(fps='24', srcfps='24', span=(0,24), source_field='Progressive',
+                            speed_percentage=200, left_offset=24, fcpxml=xml, audio=False)
+        # Identical overlap is ambiguous to an FCPXML match by source and location.
+        self.assertNotIn('retime_keys', d['clips'][0])
+        self.assertIn('重なって', d['warnings'][0])
+        shifted = xml.replace('lane="1" offset="3601s"', 'lane="1" offset="7203/2s"')
+        d = self.run_sender(fps='24', srcfps='24', span=(12,36), source_field='Progressive',
+                            speed_percentage=200, left_offset=24, fcpxml=shifted, audio=False)
+        self.assertEqual(d['clips'][0]['retime_keys'], [[0, 2], [1, 4]])
+
+    def test_interlaced_retime_retains_legacy_speed_without_frame_matching(self):
+        xml = self.retime_fixture([('3600s', '3600s', 'linear'), ('3602s', '3604s', 'linear')])
+        d = self.run_sender(fps='24', srcfps='24', span=(0, 24), source_field='Progressive',
+                            speed_percentage=200, fcpxml=xml, audio=False, interlace='1')
+        self.assertEqual(d['clips'][0]['speed'], 2)
+        self.assertNotIn('retime_keys', d['clips'][0])
+        self.assertTrue(any('フィールド情報' in notice for notice in d['warnings']))
 
     def test_small_real_retime_is_not_rounded_by_two_percent(self):
         source=SOURCE.replace('local dur = item:GetDuration()', 'local dur = 1000')

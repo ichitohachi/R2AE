@@ -47,6 +47,8 @@ function run(data, options={}) {
         return {value:null, keys, isSpatial,
             setValue(v){this.value=v;},
             setValueAtTime(t,v){const k=keys.find(x=>Math.abs(x.t-t)<1e-10);if(k)k.v=v;else keys.push({t,v});keys.sort((a,b)=>a.t-b.t);},
+            setValuesAtTimes(times, values){times.forEach((t,i)=>this.setValueAtTime(t,values[i]));},
+            nearestKeyIndex(t){return keys.reduce((best,k,i)=>Math.abs(k.t-t)<Math.abs(keys[best].t-t)?i:best,0)+1;},
             get numKeys(){return keys.length;},keyTime(k){return keys[k-1].t;},
             removeKey(k){keys.splice(k-1,1);},setInterpolationTypeAtKey(){},
             setSpatialAutoBezierAtKey(){},setSpatialContinuousAtKey(){},keyInSpatialTangent(){return [1,2,3];},
@@ -78,8 +80,11 @@ function run(data, options={}) {
                         },
                         remove(){this.removed=true;}};
                     Object.defineProperty(layer,'timeRemapEnabled',{set(v){
-                        if(v){const tr=layer.property('ADBE Time Remapping');tr.setValueAtTime(0,0);tr.setValueAtTime(footage.duration,footage.duration);}
-                    }});
+                        const tr=layer.property('ADBE Time Remapping');
+                        if(v){tr.setValueAtTime(0,0);tr.setValueAtTime(footage.duration,footage.duration);}
+                        else tr.keys.length=0;
+                        this.remap=v;
+                    }, get(){return this.remap;}});
                     comp.list.push(layer);return layer;
                 }};state.comps.push(comp);return comp;
             }},
@@ -125,6 +130,27 @@ function fixture(overrides={}, clips){return {schema_version:2,fps:30000/1001,wi
         speed:1,src_fps:60000/1001,src_field:'Upper Field First',mute_audio:true,
         transform:{flip_x:0,flip_y:0}}],...overrides};}
 function test(name,fn){fn();checks++;console.log('PASS',name);}
+test('the full 10-minute DF span preserves all 12 progressive cuts and source trims',()=>{
+    const fps=30000/1001;
+    const edges=Array.from({length:13},(_,i)=>Math.round(50*i*fps));
+    const d=fixture({fps,duration:17982,display_start_frame:107892,interlaced:true});
+    const source=d.clips[0];
+    d.clips=edges.slice(0,-1).map((offset,i)=>({...source,path:`/test/progressive-${i}.mov`,
+        offset,duration:edges[i+1]-offset,source_in:i%2,src_fps:fps,src_field:'Progressive'}));
+    const comp=run(d,{nativeFps:fps}).comps[0];
+    assert.equal(comp.frameRate,fps);
+    assert.equal(comp.displayStartFrame,107892);
+    assert.equal(comp.dropFrame,true);
+    assert.equal(comp.duration,17982/fps);
+    assert.equal(comp.list.length,12);
+    for(const [i,layer] of comp.list.entries()) {
+        assert.equal(Math.round(layer.inPoint*fps),edges[i]);
+        assert.equal(Math.round(layer.outPoint*fps),edges[i+1]);
+        assert.equal(Math.round((layer.inPoint-layer.startTime)*fps),i%2);
+        assert.equal(layer.footage.mainSource.fieldSeparationType,0);
+        assert.equal(layer.property('ADBE Time Remapping').keys.length,0);
+    }
+});
 test('mixed fps, DF and original media are independent',()=>{
     const s=run(fixture());const c=s.comps[0], l=c.list[0];
     assert.equal(c.frameRate,30000/1001);assert.equal(c.dropFrame,true);assert.equal(c.displayStartFrame,107892);
@@ -402,6 +428,52 @@ test('retime key clipping preserves slope and layer duration',()=>{
     assert.equal(keys.length,2);assert.ok(Math.abs((keys[1].v-keys[0].v)/(keys[1].t-keys[0].t)+1)<1e-10);
     assert.equal(l.outPoint,c.duration);
 });
+test('Nearest reproduces mixed-rate variable speed, freezes and reverse at comp frame times',()=>{
+    const d=fixture({fps:24, duration:12});
+    const clips=d.clips;
+    Object.assign(clips[0],{offset:3,duration:8,source_in:8,src_fps:30,src_frames:180,
+        src_field:'Progressive',speed:1,
+        retime_keys:[[0,8/30],[3/24,13/30],[5/24,13/30],[7/24,9/30]]});
+    const l=run(d,{nativeFps:30,sourceDuration:6}).comps[0].list[0];
+    const keys=l.property('ADBE Time Remapping').keys;
+    const output=[];
+    for(let i=3;i<11;i++){
+        const t=i/24;
+        const index=keys.findIndex(key=>key.t>=t);
+        const b=keys[index], a=keys[Math.max(0,index-1)];
+        output.push(Math.floor(30*(a===b?a.v:a.v+(b.v-a.v)*(t-a.t)/(b.t-a.t))));
+    }
+    assert.deepEqual(output,[8,9,11,13,13,13,11,9]);
+    assert.equal(l.inPoint,3/24);
+    assert.equal(l.outPoint,11/24);
+    assert.ok(keys.length<output.length);
+});
+test('a one-frame remap keeps only the intended source key',()=>{
+    const d=fixture({fps:24,duration:20});
+    Object.assign(d.clips[0],{offset:17,duration:1,source_in:12,src_fps:24,
+        speed:0,retime_keys:[[0,0.5],[1/24,0.5]]});
+    const l=run(d,{nativeFps:24}).comps[0].list[0];
+    assert.deepEqual(l.property('ADBE Time Remapping').keys,[{t:17/24,v:12.25/24}]);
+    assert.equal(l.outPoint,18/24);
+});
+test('Nearest handles Resolve rounding just below a source frame boundary',()=>{
+    const d=fixture({fps:24,duration:3});
+    const srcFps=24000/1001;
+    Object.assign(d.clips[0],{source_in:38,src_fps:srcFps,duration:3,speed:2,
+        retime_keys:[[0,38/srcFps],[3/24,38/srcFps+6/24]]});
+    const l=run(d,{nativeFps:srcFps}).comps[0].list[0];
+    const keys=l.property('ADBE Time Remapping').keys;
+    assert.deepEqual(keys.map(key=>Math.floor(key.v*srcFps)),[38,40,41]);
+});
+test('frame count mismatch falls back and reports that exact mapping could not be applied',()=>{
+    const d=fixture({fps:24,duration:24});
+    Object.assign(d.clips[0],{source_in:12,src_fps:24,src_frames:520,duration:24,
+        speed:2,retime_keys:[[0,0.5],[1,2.5]]});
+    const s=run(d,{nativeFps:24,sourceDuration:20});
+    const l=s.comps[0].list[0];
+    assert.match(s.alerts.join('\n'),/コマ合わせに失敗/);
+    assert.deepEqual(l.property('ADBE Time Remapping').keys,[{t:0,v:0.5},{t:1,v:2.5}]);
+});
 test('invalid retime removes partial layer instead of substituting normal speed',()=>{
     const d=fixture();d.clips[0].speed=2;d.clips[0].source_in=-10;
     const s=run(d);assert.equal(s.comps[0].list[0].removed,true);assert.ok(s.alerts.some(x=>x.includes('速度適用失敗')));
@@ -411,7 +483,8 @@ test('per-transfer cache avoids existing manually interpreted footage',()=>{
     const s=run(d);assert.equal(s.imports.length,1);assert.equal(s.comps[0].list[0].footage.frameRate,60000/1001);
 });
 test('field variants of the same file are imported independently',()=>{
-    const d=fixture();d.clips.push({...d.clips[0],src_field:'Lower Field First'});
+    const d=fixture();d.clips[0].src_field='Upper Field';
+    d.clips.push({...d.clips[0],src_field:'Lower Field'});
     const s=run(d);assert.equal(s.imports.length,2);
     assert.deepEqual(s.imports.map(item=>item.mainSource.fieldSeparationType).sort(),[1,2]);
 });

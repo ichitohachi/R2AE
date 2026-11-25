@@ -329,8 +329,8 @@
     function fieldMode(value) {
         var v = String(value || "").toLowerCase();
         if (v === "progressive") return FieldSeparationType.OFF;
-        if (v === "upper field first" || v === "upper") return FieldSeparationType.UPPER_FIELD_FIRST;
-        if (v === "lower field first" || v === "lower") return FieldSeparationType.LOWER_FIELD_FIRST;
+        if (v === "upper field first" || v === "upper field" || v === "upper") return FieldSeparationType.UPPER_FIELD_FIRST;
+        if (v === "lower field first" || v === "lower field" || v === "lower") return FieldSeparationType.LOWER_FIELD_FIRST;
         return null;
     }
 
@@ -550,14 +550,93 @@
             needsConform: !useElapsedTime && hasMotion && Math.abs(srcFps - aeFps) > 0.01 };
     }
 
+    function setRetimeKeys(layer, times, values) {
+        layer.startTime = 0;
+        layer.timeRemapEnabled = true;
+        var tr = layer.property("ADBE Time Remapping");
+        if (!tr) throw new Error("Time Remapプロパティが取得できません");
+        var defaults = [];
+        for (var i = 1; i <= tr.numKeys; i++) defaults.push(tr.keyTime(i));
+        tr.setValuesAtTimes(times, values);
+        // 有効化時のキーは、同じ時刻に転送したキーがある場合だけ残す。
+        for (var j = defaults.length - 1; j >= 0; j--) {
+            var index = tr.nearestKeyIndex(defaults[j]);
+            var time = tr.keyTime(index);
+            var k = 0;
+            while (k < times.length && times[k] < time - 1e-6) k++;
+            if (Math.abs(time - defaults[j]) < 1e-6
+                && (k === times.length || Math.abs(times[k] - time) > 1e-6)) tr.removeKey(index);
+        }
+        for (var n = 1; n <= tr.numKeys; n++) {
+            tr.setInterpolationTypeAtKey(n, KeyframeInterpolationType.LINEAR, KeyframeInterpolationType.LINEAR);
+        }
+    }
+
+    function placeMappedFrames(layer, c, fps, footage) {
+        var map = c.retime_keys;
+        var count = Math.round(c.duration);
+        var sourceCount = Math.round(footage.duration * footage.frameRate);
+        if (!(c.src_fps > 0) || !footage.hasVideo || footage.mainSource.isStill
+            || count < 1 || Math.abs(c.duration - count) > 1e-6
+            || Math.abs(c.offset - Math.round(c.offset)) > 1e-6 || sourceCount < 1
+            || (c.src_frames > 0 && Math.abs(c.src_frames - sourceCount) > 1)) {
+            throw new Error("素材のフレーム数またはクリップの境界が一致しません");
+        }
+
+        var times = [], values = [];
+        function addKey(frame, sourceFrame) {
+            times.push((c.offset + frame) / fps);
+            // サブフレーム誤差で前後のコマを拾わないよう、表示区間内を指す。
+            values.push((sourceFrame + 0.25) / footage.frameRate);
+        }
+        var segment = 0, previousFrame, previousDelta;
+        for (var i = 0; i < count; i++) {
+            var time = i / fps;
+            while (segment + 2 < map.length && time > map[segment + 1][0]) segment++;
+            var a = map[segment], b = map[segment + 1];
+            if (!a || !b || !(b[0] > a[0])) throw new Error("速度マップの時刻が不正です");
+            var t = Math.max(0, Math.min(1, (time - a[0]) / (b[0] - a[0])));
+            var position = (a[1] + (b[1] - a[1]) * t) * c.src_fps;
+            // 実測したResolveの境界付近の丸め。素材フレーム単位で吸収する。
+            var frame = Math.floor(position + 0.0025);
+            if (!isFinite(frame) || frame < -1 || frame > sourceCount) {
+                throw new Error("速度マップが素材尺の範囲外です");
+            }
+            frame = Math.max(0, Math.min(sourceCount - 1, frame));
+            if (i === 0) {
+                addKey(0, frame);
+            } else {
+                var delta = frame - previousFrame;
+                // 同じコマ間隔が続く区間は端点だけで表せる。
+                if (i > 1 && delta !== previousDelta) addKey(i - 1, previousFrame);
+                previousDelta = delta;
+            }
+            previousFrame = frame;
+        }
+        if (count > 1) addKey(count - 1, previousFrame);
+        setRetimeKeys(layer, times, values);
+        layer.inPoint = c.offset / fps;
+        layer.outPoint = (c.offset + c.duration) / fps;
+        return "Time Remap（元コマを合わせる）";
+    }
+
     // レイヤーの配置。リタイムがある場合はタイムリマップで再現する。
     // 失敗したクリップは外側で除去し、誤った等速配置を残さない。
     // 戻り値: 状態を表す文字列（診断用）
-    function placeLayer(layer, c, fps, footage, timing) {
+    function placeLayer(layer, c, fps, footage, timing, notices) {
         var offsetSec = c.offset / fps;
         var durSec = c.duration / fps;
         var inSec = timing.inSec;
         var speed = ((c.speed != null) ? c.speed : 1) * timing.rate;
+
+        if (c.retime_keys && c.kind === "video") {
+            try {
+                return placeMappedFrames(layer, c, fps, footage);
+            } catch (e) {
+                if (layer.timeRemapEnabled) layer.timeRemapEnabled = false;
+                notices.push(c.name + ": コマ合わせに失敗。従来の速度で転送します（" + e.toString() + "）");
+            }
+        }
 
         function placeNormal() {
             layer.startTime = offsetSec - inSec;
@@ -582,16 +661,7 @@
             var t2 = offsetSec + durSec;
             if (t2 - t1 < 1e-9) throw new Error("尺が0です");
 
-            // タイムリマップ有効化でイン/アウトがリセットされるため先に行う
-            layer.startTime = 0;
-            layer.timeRemapEnabled = true;
-
-            var tr = layer.property("ADBE Time Remapping");
-            if (!tr) throw new Error("Time Remapプロパティが取得できません");
-
-            // 先に必要なキーを打つ。全キーを削除すると
-            // タイムリマップ自体が無効化されプロパティが隠れてしまう
-            // タイムリマップの値は素材の尺を超えられないためクランプする
+            // タイムリマップの値は素材の尺を超えられないためクランプする。
             var maxSrc = null;
             try { maxSrc = footage.duration; } catch (eD) {}
 
@@ -611,27 +681,7 @@
                 }
             }
 
-            tr.setValueAtTime(t1, startVal);
-            tr.setValueAtTime(t2, endVal);
-
-            // 有効化時に自動生成された不要なキーを後から削除する
-            for (var k = tr.numKeys; k >= 1; k--) {
-                if (tr.numKeys <= 2) break;
-                var kt = tr.keyTime(k);
-                if (Math.abs(kt - t1) > 1e-6 && Math.abs(kt - t2) > 1e-6) {
-                    tr.removeKey(k);
-                }
-            }
-
-            for (var j = 1; j <= tr.numKeys; j++) {
-                try {
-                    tr.setInterpolationTypeAtKey(
-                        j,
-                        KeyframeInterpolationType.LINEAR,
-                        KeyframeInterpolationType.LINEAR
-                    );
-                } catch (eK) {}
-            }
+            setRetimeKeys(layer, [t1, t2], [startVal, endVal]);
 
             // キーを打った後にイン/アウトを確定させる
             layer.inPoint = t1;
@@ -769,10 +819,10 @@
                     notices.push(c.name + ": Resolveの素材解釈fps=" + c.src_fps
                         + " / AEの素材fps=" + footage.frameRate + "。差はTime Remapに反映（要確認）");
                 }
-                var status = placeLayer(layer, c, fps, footage, timing);
+                var status = placeLayer(layer, c, fps, footage, timing, notices);
                 if (status.indexOf("失敗") >= 0) {
                     failed.push(c.name + " " + status);
-                } else if (status !== "等速" && c.speed != null && c.speed !== 1) {
+                } else if (status !== "等速" && (c.retime_keys || (c.speed != null && c.speed !== 1))) {
                     retimed.push(c.name + " -> " + status);
                 }
 
